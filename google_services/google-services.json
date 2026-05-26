@@ -1,0 +1,62 @@
+{
+  "project_info": {
+    "project_number": "382775998205",
+    "project_id": "moneyflow-ddc15",
+    "storage_bucket": "moneyflow-ddc15.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:382775998205:android:56e8bf805973ab26923094",
+        "android_client_info": {
+          "package_name": "co.tpcreative.moneyflow.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "382775998205-2fhcdcki4kbeuamcn89buki7hld93aee.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "co.tpcreative.moneyflow.app",
+            "certificate_hash": "5e8f16062ea3cd2c4a0d547876baa6f38cabf625"
+          }
+        },
+        {
+          "client_id": "382775998205-f764hniiqm6bnmjnra0rkpihfbocdk0b.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "co.tpcreative.moneyflow.app",
+            "certificate_hash": "7432989525faa4fdfaa270a5ba91d7b28858ff3f"
+          }
+        },
+        {
+          "client_id": "382775998205-0apkrdavr3oe2ia50j3vfhebt8adbh2k.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCmf_j1oZhzZCsXilaLgO1HA_pFHBo8sF4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "382775998205-0apkrdavr3oe2ia50j3vfhebt8adbh2k.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "382775998205-39oh775pgk083aibj1e9rs2oi03dmdrt.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "co.tpcreative.moneyflow"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
