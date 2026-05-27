@@ -8,6 +8,7 @@ import 'package:google_sign_in/google_sign_in.dart';
 import '../constants/theme.dart';
 import '../context/store.dart';
 import '../utils/localization.dart';
+import 'dart:io';
 
 class AuthScreen extends StatefulWidget {
   const AuthScreen({super.key});
@@ -20,9 +21,16 @@ class _AuthScreenState extends State<AuthScreen> {
   bool _loading = false;
   String _error = '';
 
+
+
+// ✅ Each platform gets its own correct client ID
   final _googleSignIn = GoogleSignIn(
-    // Replace with your Web client ID from Google Cloud Console
-    clientId: '382775998205-0apkrdavr3oe2ia50j3vfhebt8adbh2k.apps.googleusercontent.com',
+    clientId: Platform.isIOS
+    // iOS CLIENT_ID from GoogleService-Info.plist
+        ? '382775998205-gmh0c7kk43ddmnp3ir7orbc5asp7bdjf.apps.googleusercontent.com'
+    // Android CLIENT_ID from google-services.json (type-3 web client,
+    // used as serverClientId on Android to get an ID token)
+        : '382775998205-0apkrdavr3oe2ia50j3vfhebt8adbh2k.apps.googleusercontent.com',
     scopes: ['email'],
   );
 

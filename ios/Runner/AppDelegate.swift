@@ -11,7 +11,7 @@ import UIKit
     }
     
     func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
-        GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: "382775998205-gmh0c7kk43ddmnp3ir7orbc5asp7bdjf.apps.googleusercontent.com")
+    GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: "382775998205-gmh0c7kk43ddmnp3ir7orbc5asp7bdjf.apps.googleusercontent.com")
         GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     }
 }
