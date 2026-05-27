@@ -1,8 +1,5 @@
-buildscript {
-    dependencies {
-        classpath("com.google.gms:google-services:4.4.2")
-    }
-}
+// Root build.gradle.kts — plugin declarations are in settings.gradle.kts
+// Do NOT add a buildscript{} block here; it conflicts with the plugin DSL.
 
 allprojects {
     repositories {

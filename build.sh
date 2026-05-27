@@ -1,577 +1,1014 @@
 #!/usr/bin/env bash
-# =============================================================================
-# MoneyFlow — build.sh
-# Usage: chmod +x build.sh && ./build.sh
-# =============================================================================
-
+# =============================================================
+#  MoneyFlow — Build Tool
+#  Package : co.tpcreative.moneyflow.app
+#  Firebase : moneyflow-ddc15
+# =============================================================
 set -euo pipefail
 
-# ─── Colours ──────────────────────────────────────────────────────────────────
+PACKAGE_NAME="co.tpcreative.moneyflow.app"
+IOS_BUNDLE_ID="co.tpcreative.moneyflow.app"
+FIREBASE_PROJECT_ID="moneyflow-ddc15"
+COMPILE_SDK=36
+TARGET_SDK=36
+MIN_SDK=21
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR"
+
+# ── Android SDK / AVD paths ───────────────────────────────────
+# Point to your custom AVD folder so Flutter and the emulator
+# tool use YOUR avd directory instead of ~/.android/avd
+export ANDROID_AVD_HOME="/Users/phong070/Documents/AndroidSDK/avd"
+# Also set SDK root if not already set in your shell profile
+export ANDROID_HOME="${ANDROID_HOME:-/Users/phong070/Documents/AndroidSDK}"
+export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/Users/phong070/Documents/AndroidSDK}"
+
+# ── Cross-platform sed in-place ───────────────────────────────
+# macOS uses BSD sed (sed -i ''), Linux uses GNU sed (sed -i)
+if [[ "$(uname)" == "Darwin" ]]; then
+  _sed_i() { sed -i '' "$@"; }
+else
+  _sed_i() { sed -i "$@"; }
+fi
+
+# ── Colours ──────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-info()    { echo -e "  ${CYAN}›${RESET} $*"; }
-success() { echo -e "  ${GREEN}✔${RESET} $*"; }
-warn()    { echo -e "  ${YELLOW}⚠${RESET}  $*"; }
-error()   { echo -e "\n  ${RED}✖ ERROR:${RESET} $*\n"; exit 1; }
-step()    { echo -e "\n  ${BOLD}${CYAN}── Step $1: $2${RESET}"; }
-divider() { echo -e "  ${BOLD}──────────────────────────────────────────────${RESET}"; }
+ok()   { echo -e "  ${GREEN}✔${RESET}  $*"; }
+warn() { echo -e "  ${YELLOW}⚠${RESET}  $*"; }
+err()  { echo -e "  ${RED}✘${RESET}  $*"; exit 1; }
+info() { echo -e "  ${CYAN}›${RESET}  $*"; }
+hdr()  { echo -e "\n  ${BOLD}── $* ──────────────────────────────────────────────${RESET}"; }
 
-# ─── Config (from your Firebase files — do NOT change these) ──────────────────
-BUNDLE_ID="co.tpcreative.moneyflow.app"
-ANDROID_PACKAGE="co.tpcreative.moneyflow.app"
-WEB_CLIENT_ID="382775998205-0apkrdavr3oe2ia50j3vfhebt8adbh2k.apps.googleusercontent.com"
-REVERSED_CLIENT_ID="com.googleusercontent.apps.382775998205-gmh0c7kk43ddmnp3ir7orbc5asp7bdjf"
-FIREBASE_PROJECT_ID="moneyflow-ddc15"
-
-# ─── Fill these in before first iOS build ─────────────────────────────────────
-TEAM_ID="XXXXXXXXXX"                         # Apple Developer Team ID
-PROVISIONING_PROFILE_NAME="MoneyFlow AdHoc"  # Exact name in Apple portal
-
-# ─── Android keystore (fill in before release build) ──────────────────────────
-KEYSTORE_PATH="android/app/keystore.jks"
-KEYSTORE_ALIAS="moneyflow"
-KEYSTORE_STORE_PASS="your_store_password"
-KEYSTORE_KEY_PASS="your_key_password"
-
-GOOGLE_SERVICES_ANDROID="google-services.json"
-GOOGLE_SERVICES_IOS="GoogleService-Info.plist"
-
-IOS_RUNNER_DIR="ios/Runner"
-ANDROID_APP_DIR="android/app"
-
-# =============================================================================
-# SHARED STEPS
-# =============================================================================
-
-step_check_deps() {
-  step "1" "Check dependencies"
-  local ok=true
-  for cmd in flutter git; do
-    if command -v "$cmd" &>/dev/null; then
-      success "$cmd  $(command -v $cmd)"
-    else
-      warn "$cmd not found — please install it"
-      ok=false
-    fi
-  done
-  $ok || error "Missing required tools above. Install them and retry."
+# ── Banner ───────────────────────────────────────────────────
+show_menu() {
+  clear
+  echo -e "${BOLD}"
+  echo "  ╔══════════════════════════════════════════════════════╗"
+  echo "  ║           MoneyFlow — Build Tool                     ║"
+  echo "  ║  Package : $PACKAGE_NAME               ║"
+  echo "  ║  Firebase: $FIREBASE_PROJECT_ID                           ║"
+  echo "  ╚══════════════════════════════════════════════════════╝"
+  echo -e "${RESET}"
+  echo "  ── 🤖 Android ──────────────────────────────"
+  echo "   1) Run Android   debug"
+  echo "   2) Run Android   release"
+  echo "   3) Build Android release APK + AAB"
+  echo ""
+  echo "  ── 🍎 iOS ───────────────────────────────────"
+  echo "   4) Run iOS       debug"
+  echo "   5) Run iOS       release"
+  echo "   6) Build iOS     release IPA"
+  echo ""
+  echo "  ── 🚀 Both ──────────────────────────────────"
+  echo "   7) Build Android + iOS release"
+  echo ""
+  echo "   0) Exit"
+  echo "  ──────────────────────────────────────────────"
+  printf "  Select: "
 }
 
-step_flutter_setup() {
-  step "2" "Flutter clean & pub get"
+# ── Step 1 — Check dependencies ──────────────────────────────
+check_deps() {
+  hdr "Step 1: Check dependencies"
+  for tool in flutter git; do
+    path=$(command -v "$tool" 2>/dev/null) \
+      && ok "$tool  $path" \
+      || err "$tool not found — please install it and re-run."
+  done
+}
+
+# ── Step 2 — Flutter clean + pub get ─────────────────────────
+flutter_clean_get() {
+  hdr "Step 2: Flutter clean & pub get"
+  cd "$PROJECT_DIR"
   info "flutter clean"
   flutter clean
   info "flutter pub get"
   flutter pub get
-  success "Flutter ready"
+  ok "Flutter ready"
 }
 
-# =============================================================================
-# ANDROID STEPS
-# =============================================================================
+# ── Step 3a — Write android/settings.gradle.kts ──────────────
+# FIX: Modern Flutter (3.x+) uses the new plugin management DSL
+# in settings.gradle.kts. The google-services plugin MUST be
+# declared here — NOT in a buildscript{} block in build.gradle.kts.
+# Mixing both approaches causes "BUILD FAILED" (assembleDebug exit 1).
+write_settings_gradle() {
+  local SETTINGS="$PROJECT_DIR/android/settings.gradle.kts"
+  mkdir -p "$(dirname "$SETTINGS")"
 
-# Patches android/app/build.gradle.kts with correct package + compileSdk 35
-step_android_patch_gradle() {
-  local gradle="android/app/build.gradle.kts"
-  if [[ ! -f "$gradle" ]]; then
-    warn "$gradle not found — skipping patch"
-    return
+  # Read the Flutter SDK path from local.properties (already generated by Flutter)
+  local LOCAL_PROPS="$PROJECT_DIR/android/local.properties"
+  if [[ ! -f "$LOCAL_PROPS" ]]; then
+    warn "android/local.properties not found — run 'flutter pub get' first, then retry."
   fi
 
-  # Fix namespace & applicationId
-  sed -i '' \
-    "s|namespace = \".*\"|namespace = \"$ANDROID_PACKAGE\"|g" \
-    "$gradle" 2>/dev/null || \
-  sed -i \
-    "s|namespace = \".*\"|namespace = \"$ANDROID_PACKAGE\"|g" \
-    "$gradle"
+  cat > "$SETTINGS" <<'EOF'
+pluginManagement {
+    val flutterSdkPath = run {
+        val properties = java.util.Properties()
+        file("local.properties").inputStream().use { properties.load(it) }
+        val flutterSdkPath = properties.getProperty("flutter.sdk")
+        require(flutterSdkPath != null) { "flutter.sdk not set in local.properties" }
+        flutterSdkPath
+    }
 
-  sed -i '' \
-    "s|applicationId = \".*\"|applicationId = \"$ANDROID_PACKAGE\"|g" \
-    "$gradle" 2>/dev/null || \
-  sed -i \
-    "s|applicationId = \".*\"|applicationId = \"$ANDROID_PACKAGE\"|g" \
-    "$gradle"
+    includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
 
-  # Fix compileSdk — replace flutter.compileSdkVersion or any number with 35
-  sed -i '' \
-    "s|compileSdk = .*|compileSdk = 35|g" \
-    "$gradle" 2>/dev/null || \
-  sed -i \
-    "s|compileSdk = .*|compileSdk = 35|g" \
-    "$gradle"
-
-  # Fix targetSdk
-  sed -i '' \
-    "s|targetSdk = .*|targetSdk = 35|g" \
-    "$gradle" 2>/dev/null || \
-  sed -i \
-    "s|targetSdk = .*|targetSdk = 35|g" \
-    "$gradle"
-
-  # Fix minSdk
-  sed -i '' \
-    "s|minSdk = .*|minSdk = 21|g" \
-    "$gradle" 2>/dev/null || \
-  sed -i \
-    "s|minSdk = .*|minSdk = 21|g" \
-    "$gradle"
-
-  # Ensure google-services plugin is present
-  if ! grep -q "com.google.gms.google-services" "$gradle"; then
-    sed -i '' \
-      "s|id(\"com.android.application\")|id(\"com.android.application\")\n    id(\"com.google.gms.google-services\")|g" \
-      "$gradle" 2>/dev/null || \
-    sed -i \
-      "s|id(\"com.android.application\")|id(\"com.android.application\")\n    id(\"com.google.gms.google-services\")|g" \
-      "$gradle"
-  fi
-
-  success "Patched $gradle  (package=$ANDROID_PACKAGE, compileSdk=35, targetSdk=35, minSdk=21)"
-}
-
-# Patches android/build.gradle.kts (root) to add google-services classpath
-step_android_patch_root_gradle() {
-  local root_gradle="android/build.gradle.kts"
-  if [[ ! -f "$root_gradle" ]]; then
-    warn "$root_gradle not found — skipping"
-    return
-  fi
-
-  if ! grep -q "com.google.gms:google-services" "$root_gradle"; then
-    # Prepend buildscript block before allprojects
-    local tmp
-    tmp=$(mktemp)
-    cat > "$tmp" <<'BLOCK'
-buildscript {
-    dependencies {
-        classpath("com.google.gms:google-services:4.4.2")
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
     }
 }
 
-BLOCK
-    cat "$tmp" "$root_gradle" > "${root_gradle}.new"
-    mv "${root_gradle}.new" "$root_gradle"
-    rm "$tmp"
-    success "Added google-services classpath to $root_gradle"
-  else
-    success "google-services classpath already present in $root_gradle"
-  fi
+plugins {
+    id("dev.flutter.flutter-plugin-loader") version "1.0.0"
+    id("com.android.application") version "8.11.1" apply false   // bumped: 8.7.0 → 8.11.1
+    // Google Services plugin declared here (new plugin DSL — not buildscript{} classpath)
+    id("com.google.gms.google-services") version "4.4.2" apply false
+    id("org.jetbrains.kotlin.android") version "2.2.20" apply false  // bumped: 2.1.0 → 2.2.20
 }
 
-# Copies google-services.json + creates key.properties
-step_android_platform_files() {
-  step "3" "Android — copy platform files"
+include(":app")
+EOF
+  ok "Written android/settings.gradle.kts (AGP=8.11.1, Kotlin=2.2.20, google-services=4.4.2)"
+}
 
-  if [[ -f "$GOOGLE_SERVICES_ANDROID" ]]; then
-    cp "$GOOGLE_SERVICES_ANDROID" "$ANDROID_APP_DIR/google-services.json"
-    success "google-services.json  →  $ANDROID_APP_DIR/"
-    # Verify package name
-    local pkg
-    pkg=$(python3 -c "
-import json
-d = json.load(open('$ANDROID_APP_DIR/google-services.json'))
-print(d['client'][0]['client_info']['android_client_info']['package_name'])
-" 2>/dev/null || echo "unknown")
-    if [[ "$pkg" != "$ANDROID_PACKAGE" ]]; then
-      warn "Package mismatch! json has '$pkg' but expected '$ANDROID_PACKAGE'"
+# ── Step 3b — Write android/build.gradle.kts (root) ─────────
+# FIX: NO buildscript{} block here. In the new plugin DSL, the
+# google-services classpath lived in buildscript{} — but that
+# conflicts with settings.gradle.kts plugin management and is
+# the direct cause of the assembleDebug BUILD FAILED error.
+write_root_gradle() {
+  local ROOT_GRADLE="$PROJECT_DIR/android/build.gradle.kts"
+  mkdir -p "$(dirname "$ROOT_GRADLE")"
+  cat > "$ROOT_GRADLE" <<'EOF'
+// Root build.gradle.kts — plugin declarations are in settings.gradle.kts
+// Do NOT add a buildscript{} block here; it conflicts with the plugin DSL.
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+val newBuildDir: Directory =
+    rootProject.layout.buildDirectory
+        .dir("../../build")
+        .get()
+rootProject.layout.buildDirectory.value(newBuildDir)
+
+subprojects {
+    val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
+    project.layout.buildDirectory.value(newSubprojectBuildDir)
+}
+subprojects {
+    project.evaluationDependsOn(":app")
+}
+
+tasks.register<Delete>("clean") {
+    delete(rootProject.layout.buildDirectory)
+}
+EOF
+  ok "Written android/build.gradle.kts (root — no buildscript block)"
+}
+
+# ── Step 3c — Write android/app/build.gradle.kts (app) ───────
+write_app_gradle() {
+  local GRADLE="$PROJECT_DIR/android/app/build.gradle.kts"
+  mkdir -p "$(dirname "$GRADLE")"
+
+  cat > "$GRADLE" <<EOF
+// FIX: import required in Kotlin DSL — java.util.Properties is not auto-imported
+import java.util.Properties
+
+plugins {
+    id("com.android.application")
+    id("com.google.gms.google-services")      // applied here, declared in settings.gradle.kts
+    id("dev.flutter.flutter-gradle-plugin")
+}
+
+android {
+    namespace = "$PACKAGE_NAME"
+    compileSdk = $COMPILE_SDK
+    ndkVersion = flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        applicationId = "$PACKAGE_NAME"
+        minSdk = $MIN_SDK
+        targetSdk = $TARGET_SDK
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
+
+    // Release signing — reads android/key.properties
+    val keyPropsFile = rootProject.file("key.properties")
+    if (keyPropsFile.exists()) {
+        val keyProps = Properties().apply {
+            load(keyPropsFile.inputStream())
+        }
+        signingConfigs {
+            create("release") {
+                storeFile     = file(keyProps["storeFile"] as String)
+                storePassword = keyProps["storePassword"] as String
+                keyAlias      = keyProps["keyAlias"] as String
+                keyPassword   = keyProps["keyPassword"] as String
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("debug")
+        }
+        release {
+            signingConfig = if (keyPropsFile.exists())
+                signingConfigs.getByName("release")
+            else
+                signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+flutter {
+    source = "../.."
+}
+EOF
+  ok "Written android/app/build.gradle.kts  (package=$PACKAGE_NAME, compileSdk=$COMPILE_SDK, targetSdk=$TARGET_SDK, minSdk=$MIN_SDK)"
+}
+
+# ── Step 3d — Write all three Android Gradle files ───────────
+patch_android_gradle() {
+  write_settings_gradle   # must come first — declares all plugins
+  write_root_gradle
+  write_app_gradle
+}
+
+# ── Step 3e — Read key/key.txt and write android/key.properties ──
+# key/key.txt format (lines may appear in any order, extra whitespace ok):
+#   Password: mobile@123
+#   Alias:    mobile
+# key/mobile.jks is the keystore file (stays in key/ — referenced by relative path)
+setup_key_properties() {
+  hdr "Step 3: Android — signing key setup"
+
+  local KEY_DIR="$SCRIPT_DIR/key"
+  local KEY_TXT="$KEY_DIR/key.txt"
+  local JKS_SRC="$KEY_DIR/mobile.jks"
+  local KEY_PROPS="$PROJECT_DIR/android/key.properties"
+
+  # ── Locate key.txt ────────────────────────────────────────────
+  if [[ ! -f "$KEY_TXT" ]]; then
+    warn "key/key.txt not found — skipping key.properties generation"
+    warn "  Release builds will fall back to the debug signing key."
+    return
+  fi
+
+  # ── Locate mobile.jks ────────────────────────────────────────
+  if [[ ! -f "$JKS_SRC" ]]; then
+    err "key/mobile.jks not found. Expected at: $JKS_SRC"
+  fi
+
+  # ── Parse key.txt  (handles any amount of surrounding whitespace) ──
+  local password="" alias_name=""
+  while IFS= read -r line; do
+    # Strip carriage returns (Windows line endings)
+    line="${line//$'\r'/}"
+    if [[ "$line" =~ ^[[:space:]]*[Pp]assword[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+      password="${BASH_REMATCH[1]}"
+      # Trim trailing whitespace
+      password="${password%"${password##*[![:space:]]}"}"
+    elif [[ "$line" =~ ^[[:space:]]*[Aa]lias[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+      alias_name="${BASH_REMATCH[1]}"
+      alias_name="${alias_name%"${alias_name##*[![:space:]]}"}"
+    fi
+  done < "$KEY_TXT"
+
+  if [[ -z "$password" ]]; then
+    err "Could not parse 'Password:' from key/key.txt"
+  fi
+  if [[ -z "$alias_name" ]]; then
+    err "Could not parse 'Alias:' from key/key.txt"
+  fi
+
+  # ── storeFile path: relative from android/ to key/mobile.jks ──
+  # android/key.properties is read by rootProject in android/,
+  # so "../key/mobile.jks" resolves to project_root/key/mobile.jks
+  local STORE_FILE="../key/mobile.jks"
+
+  # ── Write android/key.properties ─────────────────────────────
+  mkdir -p "$(dirname "$KEY_PROPS")"
+  cat > "$KEY_PROPS" <<EOF
+storeFile=$STORE_FILE
+storePassword=$password
+keyAlias=$alias_name
+keyPassword=$password
+EOF
+
+  ok "Written android/key.properties"
+  ok "  storeFile     → $STORE_FILE  (key/mobile.jks)"
+  ok "  keyAlias      → $alias_name"
+  ok "  storePassword → ${password//?/*}  (masked)"
+  ok "  keyPassword   → ${password//?/*}  (masked)"
+
+  # ── Verify the keystore is readable (keytool sanity check) ───
+  if command -v keytool &>/dev/null; then
+    if keytool -list \
+         -keystore "$JKS_SRC" \
+         -storepass "$password" \
+         -alias "$alias_name" \
+         &>/dev/null 2>&1; then
+      ok "Keystore verified ✔  (keytool -list passed)"
     else
-      success "Package verified: $pkg"
+      warn "Keystore verification failed — check password/alias in key/key.txt"
+      warn "  keytool -list -keystore $JKS_SRC -alias $alias_name"
     fi
   else
-    warn "google-services.json not found next to build.sh — Firebase won't work"
+    warn "keytool not found — skipping keystore verification"
+  fi
+}
+
+# ── Step 3f — Copy & validate Android platform files ─────────
+copy_android_files() {
+  hdr "Step 3: Android — copy platform files"
+
+  local GS_DST="$PROJECT_DIR/android/app/google-services.json"
+
+  # Search order: next to build.sh → google_services/ subfolder → already in place
+  local GS_SRC=""
+  for candidate in \
+      "$SCRIPT_DIR/google-services.json" \
+      "$SCRIPT_DIR/google_services/google-services.json" \
+      "$GS_DST"; do
+    [[ -f "$candidate" ]] && { GS_SRC="$candidate"; break; }
+  done
+
+  if [[ -z "$GS_SRC" ]]; then
+    err "google-services.json not found. Looked in:
+         • $SCRIPT_DIR/google-services.json
+         • $SCRIPT_DIR/google_services/google-services.json
+         • $GS_DST
+       Download it from Firebase Console → Project Settings → Your Android app."
   fi
 
-  local key_props="android/key.properties"
-  if [[ ! -f "$key_props" ]]; then
-    cat > "$key_props" <<PROPS
-storePassword=$KEYSTORE_STORE_PASS
-keyPassword=$KEYSTORE_KEY_PASS
-keyAlias=$KEYSTORE_ALIAS
-storeFile=../../$KEYSTORE_PATH
-PROPS
-    success "Created android/key.properties"
+  if [[ "$GS_SRC" != "$GS_DST" ]]; then
+    cp "$GS_SRC" "$GS_DST"
+    ok "Copied google-services.json  ($GS_SRC → android/app/)"
   else
-    success "android/key.properties already exists"
+    ok "google-services.json already in place at android/app/"
+  fi
+
+  # ── Validate package_name AND Firebase project_id ────────────
+  if command -v python3 &>/dev/null; then
+    local found_pkg found_proj
+    read -r found_pkg found_proj < <(python3 - "$GS_DST" <<'PYEOF'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    pkgs = [c["client_info"]["android_client_info"]["package_name"]
+            for c in data.get("client", [])
+            if "android_client_info" in c.get("client_info", {})]
+    proj = data.get("project_info", {}).get("project_id", "")
+    print(",".join(pkgs), proj)
+except Exception as e:
+    print("", "", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    )
+
+    # Package name check
+    if [[ "$found_pkg" == *"$PACKAGE_NAME"* ]]; then
+      ok "google-services.json package_name ✔ → $PACKAGE_NAME"
+    else
+      warn "google-services.json package_name mismatch!"
+      warn "  Expected : $PACKAGE_NAME"
+      warn "  Found    : ${found_pkg:-<could not parse>}"
+      warn "  Download the correct file from Firebase Console → Your Android app."
+    fi
+
+    # Firebase project ID check  (FIX: was never validated before)
+    if [[ "$found_proj" == "$FIREBASE_PROJECT_ID" ]]; then
+      ok "google-services.json project_id ✔ → $FIREBASE_PROJECT_ID"
+    else
+      warn "google-services.json project_id mismatch!"
+      warn "  Expected : $FIREBASE_PROJECT_ID"
+      warn "  Found    : ${found_proj:-<could not parse>}"
+    fi
+  fi
+
+  # ── key.properties ───────────────────────────────────────────
+  local KP="$PROJECT_DIR/android/key.properties"
+  if [[ -f "$KP" ]]; then
+    ok "android/key.properties already exists"
+  else
+    warn "android/key.properties missing — release signing will use debug key"
   fi
 }
 
-step_android_run() {
-  local mode="${1:-debug}"
-  step "4" "Run on Android ($mode)"
-  info "flutter run --$mode"
-  flutter run --"$mode"
-}
+# ── Step 3f — Copy & validate iOS platform files ─────────────
+copy_ios_files() {
+  hdr "Step 3: iOS — copy platform files"
 
-step_android_build() {
-  local mode="${1:-release}"
-  step "4" "Build Android APK + AAB ($mode)"
-  info "flutter build apk --$mode --split-per-abi"
-  flutter build apk --"$mode" --split-per-abi
-  success "APK  →  build/app/outputs/flutter-apk/"
-  info "flutter build appbundle --$mode"
-  flutter build appbundle --"$mode"
-  success "AAB  →  build/app/outputs/bundle/${mode}/"
-}
+  local PLIST_DST="$PROJECT_DIR/ios/Runner/GoogleService-Info.plist"
 
-# =============================================================================
-# iOS STEPS
-# =============================================================================
+  # Search order: next to build.sh → google_services/ subfolder → already in place
+  local PLIST_SRC=""
+  for candidate in \
+      "$SCRIPT_DIR/GoogleService-Info.plist" \
+      "$SCRIPT_DIR/google_services/GoogleService-Info.plist" \
+      "$PLIST_DST"; do
+    [[ -f "$candidate" ]] && { PLIST_SRC="$candidate"; break; }
+  done
 
-# Copies GoogleService-Info.plist, creates entitlements, patches Info.plist URL scheme
-step_ios_platform_files() {
-  step "3" "iOS — copy platform files"
+  if [[ -z "$PLIST_SRC" ]]; then
+    err "GoogleService-Info.plist not found. Looked in:
+         • $SCRIPT_DIR/GoogleService-Info.plist
+         • $SCRIPT_DIR/google_services/GoogleService-Info.plist
+         • $PLIST_DST
+       Download it from Firebase Console → Project Settings → Your iOS app."
+  fi
 
-  if [[ -f "$GOOGLE_SERVICES_IOS" ]]; then
-    cp "$GOOGLE_SERVICES_IOS" "$IOS_RUNNER_DIR/GoogleService-Info.plist"
-    success "GoogleService-Info.plist  →  $IOS_RUNNER_DIR/"
-    # Verify bundle ID
-    local bid
-    bid=$(/usr/libexec/PlistBuddy -c "Print :BUNDLE_ID" \
-      "$IOS_RUNNER_DIR/GoogleService-Info.plist" 2>/dev/null || echo "unknown")
-    if [[ "$bid" != "$BUNDLE_ID" ]]; then
-      warn "Bundle ID mismatch! plist has '$bid' but expected '$BUNDLE_ID'"
+  if [[ "$PLIST_SRC" != "$PLIST_DST" ]]; then
+    cp "$PLIST_SRC" "$PLIST_DST"
+    ok "Copied GoogleService-Info.plist  ($PLIST_SRC → ios/Runner/)"
+  else
+    ok "GoogleService-Info.plist already in place at ios/Runner/"
+  fi
+
+  # ── Validate BUNDLE_ID  (FIX: was read but never compared before) ──
+  local bundle_id
+  bundle_id=$(grep -A1 "<key>BUNDLE_ID</key>" "$PLIST_DST" \
+    | grep "<string>" \
+    | sed 's|.*<string>||;s|</string>.*||' \
+    | xargs 2>/dev/null || true)
+
+  if [[ -n "$bundle_id" ]]; then
+    if [[ "$bundle_id" == "$IOS_BUNDLE_ID" ]]; then
+      ok "GoogleService-Info.plist BUNDLE_ID ✔ → $bundle_id"
     else
-      success "Bundle ID verified: $bid"
+      warn "GoogleService-Info.plist BUNDLE_ID mismatch!"
+      warn "  Expected : $IOS_BUNDLE_ID"
+      warn "  Found    : $bundle_id"
+      warn "  Download the correct file from Firebase Console → Your iOS app."
     fi
   else
-    warn "GoogleService-Info.plist not found next to build.sh — Firebase won't work"
+    warn "Could not read BUNDLE_ID from GoogleService-Info.plist"
   fi
 
-  # Runner.entitlements
-  local entitlements="$IOS_RUNNER_DIR/Runner.entitlements"
-  if [[ ! -f "$entitlements" ]]; then
-    cat > "$entitlements" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>aps-environment</key>
-  <string>development</string>
-  <key>com.apple.developer.associated-domains</key>
-  <array/>
-</dict>
-</plist>
-PLIST
-    success "Created Runner.entitlements"
+  # ── Inject REVERSED_CLIENT_ID into ios/Runner/Info.plist ────
+  # Google Sign-In requires the REVERSED_CLIENT_ID as a URL scheme.
+  local reversed_id
+  reversed_id=$(grep -A1 "<key>REVERSED_CLIENT_ID</key>" "$PLIST_DST" \
+    | grep "<string>" \
+    | sed 's|.*<string>||;s|</string>.*||' \
+    | xargs 2>/dev/null || true)
+
+  local INFO_PLIST="$PROJECT_DIR/ios/Runner/Info.plist"
+  if [[ -z "$reversed_id" ]]; then
+    warn "REVERSED_CLIENT_ID not found in GoogleService-Info.plist — Google Sign-In may fail"
+  elif [[ ! -f "$INFO_PLIST" ]]; then
+    warn "ios/Runner/Info.plist not found — skipping URL scheme injection"
+  elif grep -q "$reversed_id" "$INFO_PLIST"; then
+    ok "REVERSED_CLIENT_ID URL scheme already present in Info.plist → $reversed_id"
   else
-    success "Runner.entitlements already exists"
-  fi
+    info "Injecting REVERSED_CLIENT_ID URL scheme into ios/Runner/Info.plist"
 
-  # Patch Info.plist — add REVERSED_CLIENT_ID URL scheme for Google Sign-In
-  local info_plist="$IOS_RUNNER_DIR/Info.plist"
-  if [[ -f "$info_plist" ]]; then
-    if ! grep -q "$REVERSED_CLIENT_ID" "$info_plist"; then
-      /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "$info_plist" 2>/dev/null || true
-      /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0 dict" "$info_plist" 2>/dev/null || true
-      /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleTypeRole string Editor" "$info_plist" 2>/dev/null || true
-      /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$info_plist" 2>/dev/null || true
-      /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string $REVERSED_CLIENT_ID" "$info_plist" 2>/dev/null || true
-      success "Added REVERSED_CLIENT_ID URL scheme to Info.plist"
+    # Build the URL scheme block to inject
+    local url_block
+    url_block="$(printf '\t<dict>\n\t\t<key>CFBundleTypeRole</key>\n\t\t<string>Editor</string>\n\t\t<key>CFBundleURLSchemes</key>\n\t\t<array>\n\t\t\t<string>%s</string>\n\t\t</array>\n\t</dict>' "$reversed_id")"
+
+    # FIX: Use the cross-platform _sed_i wrapper instead of hard-coded 'sed -i '''
+    # The old 'sed -i ''' is BSD/macOS only — it silently fails on Linux CI (GitHub Actions, etc.)
+    local injection_ok=false
+    if grep -q "CFBundleURLTypes" "$INFO_PLIST"; then
+      # Key exists — insert our dict into the existing <array>
+      _sed_i "/<key>CFBundleURLTypes<\/key>/{n;/<array>/a\\
+${url_block}
+}" "$INFO_PLIST" 2>/dev/null && injection_ok=true
     else
-      success "URL scheme already in Info.plist"
+      # Key does not exist — add the whole block before closing </dict></plist>
+      _sed_i "/<\/dict>/{i\\
+\\t<key>CFBundleURLTypes<\/key>\\
+\\t<array>\\
+${url_block}\\
+\\t<\/array>
+}" "$INFO_PLIST" 2>/dev/null && injection_ok=true
     fi
-  else
-    warn "ios/Runner/Info.plist not found — skipping URL scheme patch"
+
+    if grep -q "$reversed_id" "$INFO_PLIST" 2>/dev/null; then
+      ok "REVERSED_CLIENT_ID injected into Info.plist → $reversed_id"
+    else
+      warn "Auto-injection failed — add REVERSED_CLIENT_ID manually to ios/Runner/Info.plist"
+      warn "  Add this entry under CFBundleURLTypes:"
+      warn "    <dict>"
+      warn "      <key>CFBundleTypeRole</key><string>Editor</string>"
+      warn "      <key>CFBundleURLSchemes</key>"
+      warn "      <array><string>$reversed_id</string></array>"
+      warn "    </dict>"
+    fi
   fi
 }
 
-step_ios_certs() {
-  step "4" "iOS — certificates & provisioning profiles"
+# ── Step 4 — pod install ─────────────────────────────────────
+pod_install() {
+  hdr "Step 4: pod install"
+  if ! command -v pod &>/dev/null; then
+    err "CocoaPods not found. Install with: sudo gem install cocoapods"
+  fi
+  cd "$PROJECT_DIR/ios"
+  pod install --repo-update
+  cd "$PROJECT_DIR"
+  ok "pod install complete"
+}
 
-  local p12_files=()
-  while IFS= read -r -d '' f; do p12_files+=("$f"); done \
-    < <(find . -maxdepth 1 -name "*.p12" -print0 2>/dev/null)
+# ── Pick an Android target (emulator or real device) ─────────
+# Sets the global ANDROID_DEVICE_ID used by flutter run -d
+ANDROID_DEVICE_ID=""
 
-  if [[ ${#p12_files[@]} -gt 0 ]]; then
-    for p12 in "${p12_files[@]}"; do
-      info "Importing: $p12"
-      read -rsp "    Certificate password (leave blank if none): " cert_pass; echo
-      security import "$p12" \
-        -k ~/Library/Keychains/login.keychain-db \
-        -P "$cert_pass" \
-        -T /usr/bin/codesign \
-        -T /usr/bin/security 2>/dev/null \
-        || warn "Already imported or wrong password — continuing"
-      success "Imported $p12"
+# -- Sub-step: list and pick from available emulators ----------
+_pick_emulator() {
+  hdr "Step 4b: Select Emulator"
+  echo ""
+  info "Fetching available emulators..."
+
+  local raw
+  raw=$(flutter emulators 2>/dev/null || true)
+
+  local -a emu_ids emu_labels
+  local idx=0
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]]                          && continue
+    [[ "$line" == *"available emulator"* ]]   && continue
+    [[ "$line" == *"No emulators"* ]]         && continue
+    [[ "$line" == *"flutter emulators"* ]]    && continue
+    [[ "$line" != *"•"* ]]                    && continue
+
+    local emu_id emu_name platform
+    if [[ "$line" =~ ^[[:space:]]*• ]]; then
+      # Old format:  • avd_id • Display Name • platform
+      emu_id=$(  echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+      emu_name=$(echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$3); print $3}')
+      platform=$(echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$4); print $4}')
+    else
+      # New format:  avd_id • Display Name • Brand • platform
+      emu_id=$(  echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}')
+      emu_name=$(echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+      platform=$(echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$4); print $4}')
+    fi
+
+    [[ "$emu_id"   == *"ios"* || "$emu_id"   == *"apple"* ]] && continue
+    [[ "$emu_name" == *"iOS"* || "$emu_name" == *"Apple"* ]] && continue
+    [[ "$platform" == *"ios"* || "$platform" == *"apple"* ]] && continue
+    [[ "$emu_id" == "Id" || "$emu_id" == "Name" ]]           && continue
+    [[ -z "$emu_id" ]]                                        && continue
+
+    idx=$((idx+1))
+    emu_ids[$idx]="$emu_id"
+    emu_labels[$idx]="${emu_name:-$emu_id}  [$emu_id]"
+  done <<< "$raw"
+
+  # Strategy 2: avdmanager fallback (Android AVDs only)
+  if [[ $idx -eq 0 ]]; then
+    local avdmanager
+    avdmanager=$(command -v avdmanager 2>/dev/null \
+      || find "$HOME/Library/Android/sdk" -name avdmanager 2>/dev/null | head -1 \
+      || true)
+
+    if [[ -n "$avdmanager" ]]; then
+      local avd_name="" avd_tag=""
+      while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*Name:[[:space:]]+(.*) ]]; then
+          avd_name="${BASH_REMATCH[1]}"
+          avd_tag=""
+        fi
+        if [[ "$line" =~ Tag/ABI:[[:space:]]+(.*) ]]; then
+          avd_tag="${BASH_REMATCH[1]}"
+          if [[ -n "$avd_name" ]]; then
+            [[ "$avd_tag" == *"ios"* || "$avd_tag" == *"apple"* ]] && { avd_name=""; continue; }
+            idx=$((idx+1))
+            emu_ids[$idx]="$avd_name"
+            emu_labels[$idx]="$avd_name  [$avd_tag]"
+            avd_name=""
+          fi
+        fi
+      done < <("$avdmanager" list avd 2>/dev/null)
+    fi
+  fi
+
+  if [[ $idx -eq 0 ]]; then
+    warn "No emulators found by flutter or avdmanager."
+    echo ""
+    echo "  Raw output from \`flutter emulators\`:"
+    echo "$raw" | sed 's/^/    /'
+    echo ""
+    echo "  Possible fixes:"
+    echo "    • Open Android Studio → Device Manager and confirm AVDs exist"
+    echo "    • Run: flutter emulators   (manually check output)"
+    echo "    • Ensure ANDROID_HOME or ANDROID_SDK_ROOT is set correctly"
+    echo ""
+    printf "  Press Enter to retry (or Ctrl-C to abort)... "
+    read -r
+    _pick_emulator; return
+  fi
+
+  for i in $(seq 1 $idx); do
+    echo "   $i)  🤖  ${emu_labels[$i]}"
+  done
+  echo ""
+  printf "  Select emulator [1-$idx]: "
+  local sel; read -r sel
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || [[ $sel -lt 1 ]] || [[ $sel -gt $idx ]]; then
+    warn "Invalid — try again."; _pick_emulator; return
+  fi
+
+  local chosen="${emu_ids[$sel]}"
+
+  # ── FIX: Check if this AVD is already running before launching ──
+  # Launching an already-running emulator causes "already running as process NNNN" error.
+  # Detect by matching the chosen AVD name against live flutter devices output.
+  local already_running=""
+  already_running=$(flutter devices 2>/dev/null     | grep -i "emulator\|android"     | grep -i "${chosen//_/ }"     | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}'     | head -1 || true)
+
+  # Broader fallback: any emulator already online
+  if [[ -z "$already_running" ]]; then
+    already_running=$(flutter devices 2>/dev/null       | grep -i "emulator-[0-9]"       | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}'       | head -1 || true)
+  fi
+
+  if [[ -n "$already_running" ]]; then
+    ANDROID_DEVICE_ID="$already_running"
+    ok "Emulator already running — reusing device id: $ANDROID_DEVICE_ID"
+  else
+    info "Launching emulator: $chosen"
+    flutter emulators --launch "$chosen" || true   # ignore non-fatal "already running" stderr
+    echo ""
+    info "Waiting for emulator to boot (up to 120s)..."
+    local waited=0
+    while true; do
+      local booted
+      booted=$(flutter devices 2>/dev/null | grep -i "android\|emulator" || true)
+      [[ -n "$booted" ]] && break
+      sleep 3; waited=$((waited+3))
+      printf "."
+      [[ $waited -ge 120 ]] && err "Emulator did not boot within 120s. Aborting."
     done
-    security set-key-partition-list \
-      -S apple-tool:,apple:,codesign: -s -k "" \
-      ~/Library/Keychains/login.keychain-db 2>/dev/null || true
-  else
-    warn "No .p12 files found — place them next to build.sh"
+    ANDROID_DEVICE_ID=$(flutter devices 2>/dev/null       | grep -i "android\|emulator"       | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}'       | head -1)
+    echo ""; ok "Emulator booted → device id: $ANDROID_DEVICE_ID"
+  fi
+}
+
+# -- Sub-step: list and pick from connected real devices -------
+_pick_real_device() {
+  hdr "Step 4b: Select Real Device"
+  echo ""
+  info "Scanning for connected Android devices..."
+  echo "  Make sure USB debugging is enabled on your phone."
+  echo "  (Settings → Developer Options → USB Debugging)"
+  echo ""
+
+  local raw
+  raw=$(flutter devices 2>/dev/null | grep -i "android\|sdk built" || true)
+
+  local -a dev_ids dev_labels
+  local idx=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local dev_id dev_name
+    dev_id=$(echo "$line"   | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+    dev_name=$(echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}')
+    [[ -z "$dev_id" ]] && continue
+    idx=$((idx+1))
+    dev_ids[$idx]="$dev_id"
+    dev_labels[$idx]="$dev_name  ($dev_id)"
+  done <<< "$raw"
+
+  if [[ $idx -eq 0 ]]; then
+    warn "No real Android device detected."
+    echo ""
+    printf "  Connect your device via USB, then press Enter to retry (or Ctrl-C to abort)... "
+    read -r
+    _pick_real_device; return
   fi
 
-  local profile_files=()
-  while IFS= read -r -d '' f; do profile_files+=("$f"); done \
-    < <(find . -maxdepth 1 -name "*.mobileprovision" -print0 2>/dev/null)
+  for i in $(seq 1 $idx); do
+    echo "   $i)  📱  ${dev_labels[$i]}"
+  done
+  echo ""
+  printf "  Select device [1-$idx]: "
+  local sel; read -r sel
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || [[ $sel -lt 1 ]] || [[ $sel -gt $idx ]]; then
+    warn "Invalid — try again."; _pick_real_device; return
+  fi
 
-  if [[ ${#profile_files[@]} -gt 0 ]]; then
-    local profiles_dir="$HOME/Library/MobileDevice/Provisioning Profiles"
-    mkdir -p "$profiles_dir"
-    for profile in "${profile_files[@]}"; do
-      local uuid
-      uuid=$(python3 -c "
-import subprocess, plistlib
-data = subprocess.check_output(['security','cms','-D','-i','$profile'])
-print(plistlib.loads(data)['UUID'])
-" 2>/dev/null || echo "unknown-$$")
-      cp "$profile" "$profiles_dir/$uuid.mobileprovision"
-      success "Installed profile  →  $profiles_dir/$uuid.mobileprovision"
+  ANDROID_DEVICE_ID="${dev_ids[$sel]}"
+  ok "Device selected: $ANDROID_DEVICE_ID"
+}
+
+# -- Main picker: ask emulator vs real device first ------------
+pick_android_device() {
+  hdr "Step 4: Select Android target type"
+  echo ""
+  echo "   1)  🤖  Emulator  (Android Virtual Device)"
+  echo "   2)  📱  Real Device  (USB / Wi-Fi ADB)"
+  echo ""
+  printf "  Choose [1-2]: "
+  local choice; read -r choice
+  case "$choice" in
+    1) _pick_emulator    ;;
+    2) _pick_real_device ;;
+    *) warn "Invalid — enter 1 or 2."; pick_android_device ;;
+  esac
+  ok "Target ready → $ANDROID_DEVICE_ID"
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  ANDROID
+# ═══════════════════════════════════════════════════════════════
+
+# ── Uninstall app if signature mismatch would block install ──────
+# INSTALL_FAILED_UPDATE_INCOMPATIBLE occurs when the installed APK was signed
+# with a different key (e.g. debug key) than the one being installed now.
+# Silently uninstalling first is the standard fix.
+uninstall_if_incompatible() {
+  local device_id="$1"
+  if ! command -v adb &>/dev/null; then
+    warn "adb not found — skipping signature-conflict check"
+    return
+  fi
+
+  local installed_sig
+  installed_sig=$(adb -s "$device_id" shell pm list packages 2>/dev/null     | grep "$PACKAGE_NAME" || true)
+
+  if [[ -n "$installed_sig" ]]; then
+    info "App already installed on $device_id — uninstalling to avoid signature mismatch"
+    adb -s "$device_id" uninstall "$PACKAGE_NAME" 2>/dev/null &&       ok "Uninstalled $PACKAGE_NAME (signature conflict prevention)" ||       warn "Uninstall failed — install may fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE"
+  fi
+}
+
+
+# ── patch_main_activity ───────────────────────────────────────
+# Ensures MainActivity.kt (or .java) lives at the path Android
+# expects for the current PACKAGE_NAME, and that its `package`
+# declaration matches.  This is the fix for:
+#   ClassNotFoundException: <package>.MainActivity
+# which happens when the file sits in a stale package directory
+# from a previous name, or was never moved after renaming.
+patch_main_activity() {
+  hdr "Step 3: Android — patch MainActivity package"
+
+  local pkg_path="${PACKAGE_NAME//.//}"   # co.tpcreative... → co/tpcreative/...
+  local kotlin_dir="$PROJECT_DIR/android/app/src/main/kotlin"
+  local java_dir="$PROJECT_DIR/android/app/src/main/java"
+  local target_dir=""
+  local ext=""
+
+  # Determine whether project uses kotlin/ or java/ source root
+  if [[ -d "$kotlin_dir" ]]; then
+    target_dir="$kotlin_dir/$pkg_path"
+    ext="kt"
+  else
+    target_dir="$java_dir/$pkg_path"
+    ext="java"
+  fi
+
+  local target_file="$target_dir/MainActivity.$ext"
+
+  # ── Find the existing MainActivity (may be in a different package dir) ──
+  local found=""
+  found=$(find "$PROJECT_DIR/android/app/src/main"     -name "MainActivity.$ext" 2>/dev/null | head -1 || true)
+
+  if [[ -z "$found" ]]; then
+    # No MainActivity at all — create a minimal one
+    warn "MainActivity.$ext not found — creating a default one"
+    mkdir -p "$target_dir"
+    if [[ "$ext" == "kt" ]]; then
+      cat > "$target_file" <<KOTLIN
+package $PACKAGE_NAME
+
+import io.flutter.embedding.android.FlutterActivity
+
+class MainActivity: FlutterActivity()
+KOTLIN
+    else
+      cat > "$target_file" <<JAVA
+package $PACKAGE_NAME;
+
+import io.flutter.embedding.android.FlutterActivity;
+
+public class MainActivity extends FlutterActivity {}
+JAVA
+    fi
+    ok "Created $target_file"
+    return
+  fi
+
+  # ── Fix package declaration inside the file ──
+  local current_pkg=""
+  current_pkg=$(grep -E "^package " "$found" | head -1 | awk '{print $2}' | tr -d ';' || true)
+
+  if [[ "$current_pkg" != "$PACKAGE_NAME" ]]; then
+    warn "MainActivity.$ext has wrong package: '$current_pkg' → fixing to '$PACKAGE_NAME'"
+    _sed_i "s|^package .*|package $PACKAGE_NAME|" "$found"
+    ok "Package declaration updated in $found"
+  fi
+
+  # ── Move the file to the correct directory if needed ──
+  if [[ "$found" != "$target_file" ]]; then
+    warn "MainActivity.$ext is at wrong path — moving to correct package directory"
+    mkdir -p "$target_dir"
+    cp "$found" "$target_file"
+    # Remove old file only if it differs from target (avoid self-deletion)
+    [[ "$found" != "$target_file" ]] && rm -f "$found"
+    # Clean up now-empty parent directories
+    local old_dir; old_dir=$(dirname "$found")
+    while [[ "$old_dir" != "$kotlin_dir" && "$old_dir" != "$java_dir" ]]; do
+      rmdir "$old_dir" 2>/dev/null || break
+      old_dir=$(dirname "$old_dir")
     done
+    ok "Moved → $target_file"
   else
-    warn "No .mobileprovision files found — place them next to build.sh"
-  fi
-
-  # ExportOptions.plist
-  cat > ios/ExportOptions.plist << EXPORT
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>method</key>
-  <string>ad-hoc</string>
-  <key>teamID</key>
-  <string>$TEAM_ID</string>
-  <key>provisioningProfiles</key>
-  <dict>
-    <key>$BUNDLE_ID</key>
-    <string>$PROVISIONING_PROFILE_NAME</string>
-  </dict>
-  <key>compileBitcode</key>
-  <false/>
-  <key>stripSwiftSymbols</key>
-  <true/>
-  <key>thinning</key>
-  <string>&lt;none&gt;</string>
-</dict>
-</plist>
-EXPORT
-  success "Created ios/ExportOptions.plist  (bundle: $BUNDLE_ID)"
-}
-
-step_ios_pods() {
-  step "5" "iOS — pod install"
-  if command -v pod &>/dev/null; then
-    info "pod install --repo-update"
-    (cd ios && pod install --repo-update)
-    success "Pods installed"
-  else
-    warn "CocoaPods not found — run: sudo gem install cocoapods"
+    ok "MainActivity.$ext is at correct path with correct package ✔"
   fi
 }
 
-step_ios_run() {
-  local mode="${1:-debug}"
-  step "6" "Run on iOS ($mode)"
-  info "flutter run --$mode"
-  flutter run --"$mode"
+android_common() {
+  check_deps
+  flutter_clean_get
+  patch_android_gradle      # writes settings.gradle.kts, build.gradle.kts, app/build.gradle.kts
+  patch_main_activity       # ensures MainActivity.kt is at correct path with correct package
+  setup_key_properties      # reads key/key.txt + key/mobile.jks → android/key.properties
+  copy_android_files        # copies google-services.json, validates package + project IDs
 }
-
-step_ios_build() {
-  step "6" "Build iOS IPA (release)"
-  info "flutter build ios --release --no-codesign"
-  flutter build ios --release --no-codesign
-
-  info "xcodebuild archive"
-  xcodebuild archive \
-    -workspace ios/Runner.xcworkspace \
-    -scheme Runner \
-    -configuration Release \
-    -archivePath build/ios/Runner.xcarchive \
-    -allowProvisioningUpdates \
-    DEVELOPMENT_TEAM="$TEAM_ID" \
-    PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-    CODE_SIGN_STYLE=Manual \
-    PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_NAME" \
-    | xcpretty 2>/dev/null || true
-
-  info "xcodebuild -exportArchive"
-  xcodebuild -exportArchive \
-    -archivePath build/ios/Runner.xcarchive \
-    -exportPath build/ios/ipa \
-    -exportOptionsPlist ios/ExportOptions.plist \
-    | xcpretty 2>/dev/null || true
-
-  success "IPA  →  build/ios/ipa/"
-}
-
-# =============================================================================
-# PLATFORM PIPELINES  (ordered step-by-step)
-# =============================================================================
 
 run_android_debug() {
-  echo -e "\n${BOLD}${GREEN}▶  Android — Run Debug${RESET}"; divider
-  step_check_deps                # 1. check flutter/git
-  step_flutter_setup             # 2. clean + pub get
-  step_android_patch_root_gradle # 3a. root build.gradle.kts → google-services classpath
-  step_android_patch_gradle      # 3b. app build.gradle.kts → package + compileSdk 35
-  step_android_platform_files    # 3c. google-services.json + key.properties
-  step_android_run debug         # 4. flutter run --debug
+  echo -e "\n${BOLD}▶  Android — Run Debug${RESET}"
+  echo "  ──────────────────────────────────────────────"
+  android_common
+  pick_android_device
+  uninstall_if_incompatible "$ANDROID_DEVICE_ID"
+  hdr "Step 5: Run on Android (debug)"
+  info "flutter run -d \"$ANDROID_DEVICE_ID\" --debug"
+  flutter run -d "$ANDROID_DEVICE_ID" --debug
 }
 
 run_android_release() {
-  echo -e "\n${BOLD}${GREEN}▶  Android — Run Release${RESET}"; divider
-  step_check_deps
-  step_flutter_setup
-  step_android_patch_root_gradle
-  step_android_patch_gradle
-  step_android_platform_files
-  step_android_run release
+  echo -e "\n${BOLD}▶  Android — Run Release${RESET}"
+  echo "  ──────────────────────────────────────────────"
+  android_common
+  pick_android_device
+  uninstall_if_incompatible "$ANDROID_DEVICE_ID"
+  hdr "Step 5: Run on Android (release)"
+  info "flutter run -d \"$ANDROID_DEVICE_ID\" --release"
+  flutter run -d "$ANDROID_DEVICE_ID" --release
 }
 
 build_android_release() {
-  echo -e "\n${BOLD}${GREEN}▶  Android — Build Release APK + AAB${RESET}"; divider
-  step_check_deps
-  step_flutter_setup
-  step_android_patch_root_gradle
-  step_android_patch_gradle
-  step_android_platform_files
-  step_android_build release
+  echo -e "\n${BOLD}▶  Android — Build Release APK + AAB${RESET}"
+  echo "  ──────────────────────────────────────────────"
+  android_common
+  hdr "Step 4: Build APK"
+  info "flutter build apk --release"
+  flutter build apk --release
+  hdr "Step 4b: Build AAB"
+  info "flutter build appbundle --release"
+  flutter build appbundle --release
+  ok "Android artifacts ready in build/app/outputs/"
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  iOS
+# ═══════════════════════════════════════════════════════════════
+
+ios_common() {
+  check_deps
+  flutter_clean_get
+  copy_ios_files
+  pod_install
 }
 
 run_ios_debug() {
-  echo -e "\n${BOLD}${CYAN}▶  iOS — Run Debug${RESET}"; divider
-  step_check_deps              # 1. check flutter/git
-  step_flutter_setup           # 2. clean + pub get
-  step_ios_platform_files      # 3. GoogleService-Info.plist + entitlements + URL scheme
-  step_ios_certs               # 4. .p12 + .mobileprovision + ExportOptions.plist
-  step_ios_pods                # 5. pod install
-  step_ios_run debug           # 6. flutter run --debug
+  echo -e "\n${BOLD}▶  iOS — Run Debug${RESET}"
+  echo "  ──────────────────────────────────────────────"
+  ios_common
+  hdr "Step 5: Run on iOS (debug)"
+  info "flutter run --debug"
+  flutter run --debug
 }
 
 run_ios_release() {
-  echo -e "\n${BOLD}${CYAN}▶  iOS — Run Release${RESET}"; divider
-  step_check_deps
-  step_flutter_setup
-  step_ios_platform_files
-  step_ios_certs
-  step_ios_pods
-  step_ios_run release
+  echo -e "\n${BOLD}▶  iOS — Run Release${RESET}"
+  echo "  ──────────────────────────────────────────────"
+  ios_common
+  hdr "Step 5: Run on iOS (release)"
+  info "flutter run --release"
+  flutter run --release
 }
 
-build_ios_release() {
-  echo -e "\n${BOLD}${CYAN}▶  iOS — Build Release IPA${RESET}"; divider
-  step_check_deps
-  step_flutter_setup
-  step_ios_platform_files
-  step_ios_certs
-  step_ios_pods
-  step_ios_build
+build_ios_ipa() {
+  echo -e "\n${BOLD}▶  iOS — Build Release IPA${RESET}"
+  echo "  ──────────────────────────────────────────────"
+  ios_common
+
+  hdr "Step 5: xcodebuild archive"
+  local ARCHIVE_PATH="$PROJECT_DIR/build/ios/MoneyFlow.xcarchive"
+  local EXPORT_PATH="$PROJECT_DIR/build/ios/ipa"
+  local EXPORT_OPTIONS="$PROJECT_DIR/ios/ExportOptions.plist"
+
+  if [[ ! -f "$EXPORT_OPTIONS" ]]; then
+    warn "ios/ExportOptions.plist not found — creating a default template"
+    cat > "$EXPORT_OPTIONS" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>method</key>
+  <string>app-store</string>
+  <!-- REQUIRED: set your 10-character Apple Team ID -->
+  <key>teamID</key>
+  <string>YOUR_TEAM_ID</string>
+  <!-- REQUIRED: map bundle ID → provisioning profile name -->
+  <key>provisioningProfiles</key>
+  <dict>
+    <key>$IOS_BUNDLE_ID</key>
+    <string>YOUR_PROVISIONING_PROFILE_NAME</string>
+  </dict>
+  <key>uploadBitcode</key>
+  <false/>
+  <key>compileBitcode</key>
+  <false/>
+  <key>uploadSymbols</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+    warn "Created ios/ExportOptions.plist — you MUST edit teamID and provisioningProfiles before building."
+  fi
+
+  xcodebuild \
+    -workspace "$PROJECT_DIR/ios/Runner.xcworkspace" \
+    -scheme Runner \
+    -configuration Release \
+    -archivePath "$ARCHIVE_PATH" \
+    archive
+
+  xcodebuild \
+    -exportArchive \
+    -archivePath "$ARCHIVE_PATH" \
+    -exportOptionsPlist "$EXPORT_OPTIONS" \
+    -exportPath "$EXPORT_PATH"
+
+  ok "IPA ready at $EXPORT_PATH"
 }
 
-build_both() {
+# ═══════════════════════════════════════════════════════════════
+#  BOTH
+# ═══════════════════════════════════════════════════════════════
+
+build_both_release() {
   build_android_release
-  build_ios_release
+  build_ios_ipa
 }
 
-# =============================================================================
-# INTERACTIVE MENU
-# =============================================================================
-show_menu() {
-  clear
-  echo -e "${BOLD}${CYAN}"
-  echo "  ╔══════════════════════════════════════════════════════╗"
-  echo "  ║           MoneyFlow — Build Tool                     ║"
-  echo "  ║  Package : co.tpcreative.moneyflow.app               ║"
-  echo "  ║  Firebase: moneyflow-ddc15                           ║"
-  echo "  ╚══════════════════════════════════════════════════════╝"
-  echo -e "${RESET}"
+# ═══════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════════════
 
-  echo -e "  ${BOLD}── 🤖 Android ──────────────────────────────${RESET}"
-  echo -e "  ${CYAN} 1)${RESET} Run Android   ${YELLOW}debug${RESET}"
-  echo -e "       Step 1: Check deps"
-  echo -e "       Step 2: flutter clean + pub get"
-  echo -e "       Step 3: Patch build.gradle.kts (package + compileSdk 35)"
-  echo -e "       Step 3: Copy google-services.json + key.properties"
-  echo -e "       Step 4: flutter run --debug"
-  echo ""
-  echo -e "  ${CYAN} 2)${RESET} Run Android   ${GREEN}release${RESET}"
-  echo -e "       Step 1-3: same as above"
-  echo -e "       Step 4: flutter run --release"
-  echo ""
-  echo -e "  ${CYAN} 3)${RESET} Build Android ${GREEN}release${RESET} APK + AAB"
-  echo -e "       Step 1-3: same as above"
-  echo -e "       Step 4: flutter build apk + appbundle"
-  echo ""
-
-  echo -e "  ${BOLD}── 🍎 iOS ───────────────────────────────────${RESET}"
-  echo -e "  ${CYAN} 4)${RESET} Run iOS       ${YELLOW}debug${RESET}"
-  echo -e "       Step 1: Check deps"
-  echo -e "       Step 2: flutter clean + pub get"
-  echo -e "       Step 3: Copy GoogleService-Info.plist + entitlements + URL scheme"
-  echo -e "       Step 4: Import .p12 cert + install .mobileprovision"
-  echo -e "       Step 5: pod install"
-  echo -e "       Step 6: flutter run --debug"
-  echo ""
-  echo -e "  ${CYAN} 5)${RESET} Run iOS       ${GREEN}release${RESET}"
-  echo -e "       Step 1-5: same as above"
-  echo -e "       Step 6: flutter run --release"
-  echo ""
-  echo -e "  ${CYAN} 6)${RESET} Build iOS     ${GREEN}release${RESET} IPA"
-  echo -e "       Step 1-5: same as above"
-  echo -e "       Step 6: xcodebuild archive + export IPA"
-  echo ""
-
-  echo -e "  ${BOLD}── 🚀 Both ──────────────────────────────────${RESET}"
-  echo -e "  ${CYAN} 7)${RESET} Build Android + iOS ${GREEN}release${RESET}"
-  echo ""
-  echo -e "  ${RED} 0)${RESET} Exit"
-  divider
-  printf "  Select: "
+while true; do
+  show_menu
   read -r choice
-
   case "$choice" in
-    1) run_android_debug ;;
-    2) run_android_release ;;
-    3) build_android_release ;;
-    4) run_ios_debug ;;
-    5) run_ios_release ;;
-    6) build_ios_release ;;
-    7) build_both ;;
-    0) echo -e "\n  ${CYAN}Bye!${RESET}\n"; exit 0 ;;
-    *)
-      warn "Invalid option — try again"
-      sleep 1; show_menu; return
-      ;;
+    1) run_android_debug    ;;
+    2) run_android_release  ;;
+    3) build_android_release;;
+    4) run_ios_debug        ;;
+    5) run_ios_release      ;;
+    6) build_ios_ipa        ;;
+    7) build_both_release   ;;
+    0) echo -e "\n  Bye!\n"; exit 0 ;;
+    *) warn "Invalid option. Choose 0–7." ;;
   esac
-
   echo ""
-  divider
-  printf "  Back to menu? (y/n): "
-  read -r again
-  [[ "$again" =~ ^[Yy]$ ]] && show_menu || echo -e "\n  ${CYAN}Bye!${RESET}\n"
-}
-
-# =============================================================================
-# ENTRYPOINT
-# =============================================================================
-main() {
-  if [[ $# -eq 0 ]]; then show_menu; return; fi
-  case "${1}" in
-    run:android)     run_android_debug ;;
-    run:android:rel) run_android_release ;;
-    build:android)   build_android_release ;;
-    run:ios)         run_ios_debug ;;
-    run:ios:rel)     run_ios_release ;;
-    build:ios)       build_ios_release ;;
-    build:all)       build_both ;;
-    help|--help|-h)
-      echo "Usage: ./build.sh [command]  — or no args for interactive menu"
-      echo ""
-      echo "  run:android      Android debug   (steps 1-4)"
-      echo "  run:android:rel  Android release (steps 1-4)"
-      echo "  build:android    Android APK+AAB (steps 1-4)"
-      echo "  run:ios          iOS debug       (steps 1-6)"
-      echo "  run:ios:rel      iOS release     (steps 1-6)"
-      echo "  build:ios        iOS IPA         (steps 1-6)"
-      echo "  build:all        Android + iOS release"
-      ;;
-    *) error "Unknown command '${1}'. Run './build.sh help' for usage." ;;
-  esac
-}
-
-main "$@"
+  printf "  Press Enter to return to menu... "
+  read -r
+done

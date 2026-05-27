@@ -1,4 +1,4 @@
-package co.tpcreative.moneyflow.app.moneyflowflutter
+package co.tpcreative.moneyflow.app
 
 import io.flutter.embedding.android.FlutterActivity
 
