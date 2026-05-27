@@ -31,24 +31,49 @@ void main() async {
   //   Without the timeout, Firebase.initializeApp() can block forever
   //   and runApp() is never reached — leaving the app on the white
   //   Flutter-logo splash screen indefinitely.
+  //
+  // IMPORTANT: we no longer silently continue when Firebase fails.
+  // Swallowing the error caused a deferred [core/no-app] crash the moment
+  // any Firebase service (Auth, Firestore) was first accessed.  Instead we
+  // surface a clear error screen so the developer can act on the real cause
+  // (missing / wrong GoogleService-Info.plist on iOS, google-services.json
+  // on Android, or a network problem during cold start).
+  String? firebaseError;
   try {
     await Firebase.initializeApp()
         .timeout(const Duration(seconds: 8));
+  } on TimeoutException catch (e) {
+    firebaseError = 'Firebase init timed out (no network on cold start?)\n$e';
+    debugPrint('[main] $firebaseError');
   } catch (e) {
-    debugPrint('[main] Firebase init error (app will run without Firebase): $e');
+    firebaseError = e.toString();
+    debugPrint('[main] Firebase init error: $firebaseError');
   }
 
-  runApp(const MoneyFlowApp());
+  runApp(MoneyFlowApp(firebaseError: firebaseError));
 }
 
 // ─────────────────────────────────────────────────────────────
 //  Root widget — registers every provider
 // ─────────────────────────────────────────────────────────────
 class MoneyFlowApp extends StatelessWidget {
-  const MoneyFlowApp({super.key});
+  const MoneyFlowApp({super.key, this.firebaseError});
+
+  /// Non-null when Firebase.initializeApp() failed or timed out.
+  /// We display a clear error screen instead of running without Firebase
+  /// (which previously caused a deferred [core/no-app] crash).
+  final String? firebaseError;
 
   @override
   Widget build(BuildContext context) {
+    // Show a human-readable error instead of a confusing [core/no-app] crash.
+    if (firebaseError != null) {
+      return MaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: _FirebaseErrorScreen(error: firebaseError!),
+      );
+    }
+
     return MultiProvider(
       providers: [
         ChangeNotifierProvider(create: (_) => LocalizationProvider()),
@@ -83,6 +108,80 @@ class MoneyFlowApp extends StatelessWidget {
             ),
           ),
           home: const _AppGate(),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Firebase error screen
+//  Shown instead of running the app without Firebase, which
+//  previously caused a deferred [core/no-app] crash.
+// ─────────────────────────────────────────────────────────────
+class _FirebaseErrorScreen extends StatelessWidget {
+  const _FirebaseErrorScreen({required this.error});
+  final String error;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: DecoratedBox(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            colors: [AppColors.primaryPurple, AppColors.darkPurple],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+        ),
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.cloud_off, size: 64, color: AppColors.white),
+                const SizedBox(height: 20),
+                const Text(
+                  'Firebase could not start',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
+                    color: AppColors.white,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Common causes on iOS:\n'
+                      '• GoogleService-Info.plist missing from ios/Runner/\n'
+                      '• Plist not added to Xcode target (Copy Bundle Resources)\n'
+                      '• Bundle ID in plist does not match the app\n\n'
+                      'Common causes on Android:\n'
+                      '• google-services.json missing from android/app/\n'
+                      '• Package name mismatch',
+                  textAlign: TextAlign.left,
+                  style: TextStyle(fontSize: 13, color: AppColors.white, height: 1.6),
+                ),
+                const SizedBox(height: 24),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.black26,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    error,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: AppColors.white,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );

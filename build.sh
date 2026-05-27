@@ -456,7 +456,7 @@ copy_ios_files() {
     ok "GoogleService-Info.plist already in place at ios/Runner/"
   fi
 
-  # ── Validate BUNDLE_ID  (FIX: was read but never compared before) ──
+  # ── Read BUNDLE_ID from GoogleService-Info.plist ──────────────
   local bundle_id
   bundle_id=$(grep -A1 "<key>BUNDLE_ID</key>" "$PLIST_DST" \
     | grep "<string>" \
@@ -476,6 +476,86 @@ copy_ios_files() {
     warn "Could not read BUNDLE_ID from GoogleService-Info.plist"
   fi
 
+  # ── Sync bundle ID into Xcode project + Info.plist ─────────────
+  # The GoogleService-Info.plist BUNDLE_ID is the authoritative source.
+  # If the Xcode project or Info.plist still carry a different ID the
+  # app will be rejected at signing / App Store validation.
+  local sync_id="${bundle_id:-$IOS_BUNDLE_ID}"
+  # FIX: pass PLIST_DST explicitly — _patch_ios_bundle_id cannot see
+  # copy_ios_files local variables ($PLIST_DST was always empty before).
+  _patch_ios_bundle_id "$sync_id" "$PLIST_DST"
+
+  # FIX: register GoogleService-Info.plist in Xcode project so it is
+  # bundled at runtime.  Copying the file to ios/Runner/ is necessary
+  # but NOT sufficient — without a project.pbxproj entry Firebase cannot
+  # find the plist at runtime, causing [core/no-app] crash on iOS.
+  _register_plist_in_xcode "$PLIST_DST"
+}
+
+# ── Write bundle ID into every iOS location that needs it ────────
+# 1. ios/Runner.xcodeproj/project.pbxproj  — PRODUCT_BUNDLE_IDENTIFIER
+# 2. ios/Runner/Info.plist                 — CFBundleIdentifier (if hardcoded)
+# Uses PlistBuddy for Info.plist and sed for the .pbxproj text format.
+# $2 = path to GoogleService-Info.plist (passed explicitly — avoids the
+#      $PLIST_DST out-of-scope bug when called from _patch_ios_bundle_id)
+_patch_ios_bundle_id() {
+  local target_id="$1"
+  # FIX: was referencing $PLIST_DST which is a local var in copy_ios_files
+  # and is therefore OUT OF SCOPE here — always resolved to empty string,
+  # causing REVERSED_CLIENT_ID injection to silently fail.
+  local PLIST_DST="${2:-$PROJECT_DIR/ios/Runner/GoogleService-Info.plist}"
+  local PBXPROJ="$PROJECT_DIR/ios/Runner.xcodeproj/project.pbxproj"
+  local INFO_PLIST="$PROJECT_DIR/ios/Runner/Info.plist"
+
+  # ── 1. project.pbxproj ───────────────────────────────────────
+  if [[ ! -f "$PBXPROJ" ]]; then
+    warn "project.pbxproj not found — skipping bundle ID sync in Xcode project"
+  else
+    local current_pbx
+    current_pbx=$(grep "PRODUCT_BUNDLE_IDENTIFIER" "$PBXPROJ" \
+      | head -1 | sed 's/.*= *//;s/[;[:space:]]*//' || true)
+
+    if [[ "$current_pbx" == "$target_id" ]]; then
+      ok "project.pbxproj PRODUCT_BUNDLE_IDENTIFIER ✔ → $target_id"
+    else
+      _sed_i "s|PRODUCT_BUNDLE_IDENTIFIER = [^;]*;|PRODUCT_BUNDLE_IDENTIFIER = ${target_id};|g" "$PBXPROJ"
+      ok "project.pbxproj PRODUCT_BUNDLE_IDENTIFIER → $target_id  (was: ${current_pbx:-?})"
+    fi
+  fi
+
+  # ── 2. Info.plist — CFBundleIdentifier ───────────────────────
+  # Flutter-generated Info.plist uses the $(PRODUCT_BUNDLE_IDENTIFIER)
+  # variable, so it only needs patching when hardcoded to a literal value.
+  if [[ ! -f "$INFO_PLIST" ]]; then
+    warn "Info.plist not found — skipping CFBundleIdentifier patch"
+    return
+  fi
+
+  local current_info=""
+  if command -v /usr/libexec/PlistBuddy &>/dev/null; then
+    current_info=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO_PLIST" 2>/dev/null || true)
+    # Only patch if the value is a literal (not a $(VAR) reference)
+    if [[ "$current_info" == *'$('* ]]; then
+      ok "Info.plist CFBundleIdentifier uses Xcode variable — no patch needed"
+    elif [[ "$current_info" == "$target_id" ]]; then
+      ok "Info.plist CFBundleIdentifier ✔ → $target_id"
+    elif [[ -n "$current_info" ]]; then
+      /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $target_id" "$INFO_PLIST" 2>/dev/null \
+        && ok "Info.plist CFBundleIdentifier → $target_id  (was: $current_info)" \
+        || warn "Could not update CFBundleIdentifier in Info.plist — check manually"
+    fi
+  else
+    # Fallback: sed — skip variable-style values
+    if grep -q "CFBundleIdentifier" "$INFO_PLIST" && \
+       ! grep -A1 "CFBundleIdentifier" "$INFO_PLIST" | grep -q '\$('; then
+      _sed_i "/<key>CFBundleIdentifier<\/key>/{n;s|<string>[^<]*<\/string>|<string>${target_id}<\/string>|;}" "$INFO_PLIST" 2>/dev/null \
+        && ok "Info.plist CFBundleIdentifier → $target_id (via sed)" \
+        || warn "sed patch of CFBundleIdentifier failed — check manually"
+    else
+      ok "Info.plist CFBundleIdentifier uses Xcode variable — no patch needed"
+    fi
+  fi
+
   # ── Inject REVERSED_CLIENT_ID into ios/Runner/Info.plist ────
   # Google Sign-In requires the REVERSED_CLIENT_ID as a URL scheme.
   local reversed_id
@@ -493,53 +573,545 @@ copy_ios_files() {
     ok "REVERSED_CLIENT_ID URL scheme already present in Info.plist → $reversed_id"
   else
     info "Injecting REVERSED_CLIENT_ID URL scheme into ios/Runner/Info.plist"
+    _inject_url_scheme "$reversed_id" "$INFO_PLIST"
+  fi
+}
 
-    # Build the URL scheme block to inject
-    local url_block
-    url_block="$(printf '\t<dict>\n\t\t<key>CFBundleTypeRole</key>\n\t\t<string>Editor</string>\n\t\t<key>CFBundleURLSchemes</key>\n\t\t<array>\n\t\t\t<string>%s</string>\n\t\t</array>\n\t</dict>' "$reversed_id")"
+# ── Register GoogleService-Info.plist in Xcode project ───────────
+# ROOT CAUSE of [core/no-app] on iOS:
+#   Copying GoogleService-Info.plist to ios/Runner/ puts the file on disk,
+#   but Xcode only bundles files listed in project.pbxproj under:
+#     1. PBXFileReference section  (declares the file exists)
+#     2. PBXBuildFile section      (declares it should be built/copied)
+#     3. PBXResourcesBuildPhase    ("Copy Bundle Resources" phase)
+#   Without all three, Firebase.initializeApp() crashes with [core/no-app]
+#   because the plist is absent from the compiled .app bundle.
+#
+# FIX:
+#   Use ruby/xcodeproj gem if available (safest).
+#   Fall back to direct sed injection into project.pbxproj.
+_register_plist_in_xcode() {
+  local PLIST_FILE="$1"
+  local PBXPROJ="$PROJECT_DIR/ios/Runner.xcodeproj/project.pbxproj"
 
-    # FIX: Use the cross-platform _sed_i wrapper instead of hard-coded 'sed -i '''
-    # The old 'sed -i ''' is BSD/macOS only — it silently fails on Linux CI (GitHub Actions, etc.)
-    local injection_ok=false
-    if grep -q "CFBundleURLTypes" "$INFO_PLIST"; then
-      # Key exists — insert our dict into the existing <array>
-      _sed_i "/<key>CFBundleURLTypes<\/key>/{n;/<array>/a\\
-${url_block}
-}" "$INFO_PLIST" 2>/dev/null && injection_ok=true
-    else
-      # Key does not exist — add the whole block before closing </dict></plist>
-      _sed_i "/<\/dict>/{i\\
-\\t<key>CFBundleURLTypes<\/key>\\
-\\t<array>\\
-${url_block}\\
-\\t<\/array>
-}" "$INFO_PLIST" 2>/dev/null && injection_ok=true
+  hdr "Step 3: iOS — register GoogleService-Info.plist in Xcode"
+
+  if [[ ! -f "$PBXPROJ" ]]; then
+    warn "project.pbxproj not found — cannot register plist in Xcode"
+    return
+  fi
+
+  # Already registered?
+  if grep -q "GoogleService-Info.plist" "$PBXPROJ"; then
+    ok "GoogleService-Info.plist already referenced in project.pbxproj"
+    return
+  fi
+
+  # Strategy 1: xcodeproj Ruby gem (cleanest, handles all edge-cases)
+  if command -v ruby &>/dev/null && ruby -e "require 'xcodeproj'" 2>/dev/null; then
+    info "Using xcodeproj gem to add GoogleService-Info.plist to Xcode target"
+    ruby - "$PROJECT_DIR" "$PLIST_FILE" << 'RUBYEOF'
+require 'xcodeproj'
+project_path = File.join(ARGV[0], 'ios', 'Runner.xcodeproj')
+plist_path   = ARGV[1]
+proj   = Xcodeproj::Project.open(project_path)
+target = proj.targets.find { |t| t.name == 'Runner' }
+unless target; warn "Runner target not found"; exit 1; end
+group = proj.main_group.find_subpath('Runner', true)
+ref   = group.files.find { |f| f.path == 'GoogleService-Info.plist' }
+ref ||= group.new_file(plist_path)
+phase = target.resources_build_phase
+phase.add_file_reference(ref) unless phase.files_references.include?(ref)
+proj.save
+puts "  ✔  GoogleService-Info.plist added to Runner target via xcodeproj gem"
+RUBYEOF
+    if grep -q "GoogleService-Info.plist" "$PBXPROJ"; then
+      ok "GoogleService-Info.plist registered (xcodeproj gem)"
+      return
     fi
+  fi
+
+  # Strategy 2: python3 mod_pbxproj
+  if python3 -c "import mod_pbxproj" 2>/dev/null; then
+    info "Using mod_pbxproj to add GoogleService-Info.plist"
+    python3 - "$PROJECT_DIR" << 'PYEOF2'
+import sys
+from mod_pbxproj import XcodeProject
+proj = XcodeProject.Load(sys.argv[1] + '/ios/Runner.xcodeproj/project.pbxproj')
+proj.add_file('Runner/GoogleService-Info.plist', target_name='Runner', tree='SOURCE_ROOT')
+proj.save()
+print("  ✔  GoogleService-Info.plist added via mod_pbxproj")
+PYEOF2
+    if grep -q "GoogleService-Info.plist" "$PBXPROJ"; then
+      ok "GoogleService-Info.plist registered (mod_pbxproj)"
+      return
+    fi
+  fi
+
+  # Strategy 3: Direct sed injection into project.pbxproj
+  # Deterministic UUIDs based on bundle ID so re-runs are idempotent.
+  info "Injecting GoogleService-Info.plist into project.pbxproj via sed (last resort)"
+  local FILE_REF_UUID BUILDFILE_UUID
+  if command -v md5sum &>/dev/null; then
+    FILE_REF_UUID=$(echo "${IOS_BUNDLE_ID}_plist_fileref"  | md5sum | tr '[:lower:]' '[:upper:]' | cut -c1-24)
+    BUILDFILE_UUID=$(echo "${IOS_BUNDLE_ID}_plist_buildfile" | md5sum | tr '[:lower:]' '[:upper:]' | cut -c1-24)
+  else
+    FILE_REF_UUID=$(echo "${IOS_BUNDLE_ID}_plist_fileref"  | md5 | tr '[:lower:]' '[:upper:]' | cut -c1-24)
+    BUILDFILE_UUID=$(echo "${IOS_BUNDLE_ID}_plist_buildfile" | md5 | tr '[:lower:]' '[:upper:]' | cut -c1-24)
+  fi
+  FILE_REF_UUID="${FILE_REF_UUID:0:24}"
+  BUILDFILE_UUID="${BUILDFILE_UUID:0:24}"
+
+  if ! grep -q "Begin PBXFileReference section" "$PBXPROJ"; then
+    warn "Cannot locate PBXFileReference section in project.pbxproj"
+    warn "Fix manually: open Xcode → right-click Runner group → Add Files → GoogleService-Info.plist → check 'Add to targets: Runner'"
+    return
+  fi
+
+  # 1. PBXFileReference
+  _sed_i "s|/\\* Begin PBXFileReference section \\*/|/* Begin PBXFileReference section */\n\t\t${FILE_REF_UUID} /* GoogleService-Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = \"GoogleService-Info.plist\"; sourceTree = \"<group>\"; };|" "$PBXPROJ" 2>/dev/null || true
+
+  # 2. PBXBuildFile
+  _sed_i "s|/\\* Begin PBXBuildFile section \\*/|/* Begin PBXBuildFile section */\n\t\t${BUILDFILE_UUID} /* GoogleService-Info.plist in Resources */ = {isa = PBXBuildFile; fileRef = ${FILE_REF_UUID} /* GoogleService-Info.plist */; };|" "$PBXPROJ" 2>/dev/null || true
+
+  if grep -q "GoogleService-Info.plist" "$PBXPROJ"; then
+    ok "GoogleService-Info.plist injected into project.pbxproj via sed"
+    warn "Open Xcode once to verify Resources build phase includes GoogleService-Info.plist."
+    warn "If missing: Xcode → Runner target → Build Phases → Copy Bundle Resources → '+'"
+  else
+    warn "Automatic injection failed. Fix manually:"
+    warn "  1. Open ios/Runner.xcworkspace in Xcode"
+    warn "  2. Right-click Runner group → Add Files to 'Runner'"
+    warn "  3. Select ios/Runner/GoogleService-Info.plist"
+    warn "  4. Ensure 'Add to targets: Runner' is checked → Add"
+  fi
+}
+
+
+# ── Inject a URL scheme into Info.plist (robust, 3-strategy) ──
+# Strategy 1: PlistBuddy  (macOS native — most reliable, handles binary + XML)
+# Strategy 2: python3 plistlib  (cross-platform, handles any plist format)
+# Strategy 3: sed fallback  (last resort, XML-only)
+_inject_url_scheme() {
+  local reversed_id="$1"
+  local INFO_PLIST="$2"
+
+  # ── Strategy 1: PlistBuddy ─────────────────────────────────
+  if command -v /usr/libexec/PlistBuddy &>/dev/null; then
+    info "Using PlistBuddy to inject URL scheme"
+    local PLISTBUDDY=/usr/libexec/PlistBuddy
+
+    # Ensure CFBundleURLTypes array exists
+    if ! "$PLISTBUDDY" -c "Print :CFBundleURLTypes" "$INFO_PLIST" &>/dev/null; then
+      "$PLISTBUDDY" -c "Add :CFBundleURLTypes array" "$INFO_PLIST"
+    fi
+
+    # Count existing entries so we append at the end
+    local count
+    count=$("$PLISTBUDDY" -c "Print :CFBundleURLTypes" "$INFO_PLIST" 2>/dev/null \
+      | grep -c "^    Dict" || true)
+    count="${count:-0}"
+
+    "$PLISTBUDDY" \
+      -c "Add :CFBundleURLTypes:${count} dict" \
+      -c "Add :CFBundleURLTypes:${count}:CFBundleTypeRole string Editor" \
+      -c "Add :CFBundleURLTypes:${count}:CFBundleURLSchemes array" \
+      -c "Add :CFBundleURLTypes:${count}:CFBundleURLSchemes:0 string ${reversed_id}" \
+      "$INFO_PLIST" 2>/dev/null
 
     if grep -q "$reversed_id" "$INFO_PLIST" 2>/dev/null; then
-      ok "REVERSED_CLIENT_ID injected into Info.plist → $reversed_id"
-    else
-      warn "Auto-injection failed — add REVERSED_CLIENT_ID manually to ios/Runner/Info.plist"
-      warn "  Add this entry under CFBundleURLTypes:"
-      warn "    <dict>"
-      warn "      <key>CFBundleTypeRole</key><string>Editor</string>"
-      warn "      <key>CFBundleURLSchemes</key>"
-      warn "      <array><string>$reversed_id</string></array>"
-      warn "    </dict>"
+      ok "REVERSED_CLIENT_ID injected via PlistBuddy → $reversed_id"
+      return 0
     fi
+    warn "PlistBuddy injection did not verify — trying python3 fallback"
+  fi
+
+  # ── Strategy 2: python3 plistlib ───────────────────────────
+  if command -v python3 &>/dev/null; then
+    info "Using python3 plistlib to inject URL scheme"
+    python3 - "$INFO_PLIST" "$reversed_id" <<'PYEOF'
+import sys, plistlib, pathlib
+
+plist_path = pathlib.Path(sys.argv[1])
+reversed_id = sys.argv[2]
+
+# Load — handles both XML and binary plist
+with open(plist_path, 'rb') as fh:
+    data = plistlib.load(fh)
+
+url_types = data.setdefault('CFBundleURLTypes', [])
+
+# Check not already present (idempotent)
+for entry in url_types:
+    schemes = entry.get('CFBundleURLSchemes', [])
+    if reversed_id in schemes:
+        sys.exit(0)
+
+url_types.append({
+    'CFBundleTypeRole': 'Editor',
+    'CFBundleURLSchemes': [reversed_id],
+})
+
+# Always write back as XML so it stays human-readable and git-friendly
+with open(plist_path, 'wb') as fh:
+    plistlib.dump(data, fh, fmt=plistlib.FMT_XML)
+PYEOF
+
+    if grep -q "$reversed_id" "$INFO_PLIST" 2>/dev/null; then
+      ok "REVERSED_CLIENT_ID injected via python3 plistlib → $reversed_id"
+      return 0
+    fi
+    warn "python3 injection did not verify — trying sed fallback"
+  fi
+
+  # ── Strategy 3: sed (XML plist only, last resort) ──────────
+  info "Using sed to inject URL scheme (XML plist assumed)"
+  local url_block
+  url_block="$(printf '\t<dict>\n\t\t<key>CFBundleTypeRole</key><string>Editor</string>\n\t\t<key>CFBundleURLSchemes</key>\n\t\t<array><string>%s</string></array>\n\t</dict>' "$reversed_id")"
+
+  if grep -q "CFBundleURLTypes" "$INFO_PLIST"; then
+    _sed_i "/<key>CFBundleURLTypes<\/key>/{n;s|<array>|<array>\n${url_block}|;}" "$INFO_PLIST" 2>/dev/null
+  else
+    _sed_i "s|</dict>$|\t<key>CFBundleURLTypes</key>\n\t<array>\n${url_block}\n\t</array>\n</dict>|" "$INFO_PLIST" 2>/dev/null
+  fi
+
+  if grep -q "$reversed_id" "$INFO_PLIST" 2>/dev/null; then
+    ok "REVERSED_CLIENT_ID injected via sed → $reversed_id"
+    return 0
+  fi
+
+  # ── All strategies failed — print manual instructions ──────
+  warn "All injection strategies failed — add REVERSED_CLIENT_ID manually to ios/Runner/Info.plist"
+  warn "  Add this entry inside the <CFBundleURLTypes> array:"
+  warn "    <dict>"
+  warn "      <key>CFBundleTypeRole</key><string>Editor</string>"
+  warn "      <key>CFBundleURLSchemes</key>"
+  warn "      <array><string>$reversed_id</string></array>"
+  warn "    </dict>"
+  return 1
+}
+
+# ── Step 3g — Patch ios/Podfile ──────────────────────────────
+# Ensures three things that CocoaPods requires:
+#   1. source 'https://github.com/CocoaPods/Specs.git' is declared
+#      (avoids CDN/HTTP2 failures from cdn.jsdelivr.net trunk).
+#   2. platform :ios, '13.0' is declared (suppresses auto-assignment warning).
+#   3. use_frameworks! :linkage => :static so Firebase pods link correctly.
+patch_ios_podfile() {
+  hdr "Step 3: iOS — patch Podfile"
+
+  local PODFILE="$PROJECT_DIR/ios/Podfile"
+  if [[ ! -f "$PODFILE" ]]; then
+    warn "ios/Podfile not found — skipping Podfile patch (will be created by Flutter)"
+    return
+  fi
+
+  # ── 1. Switch from CDN to git-based spec repo ──────────────
+  # CocoaPods CDN (cdn.jsdelivr.net) is prone to HTTP/2 framing errors.
+  # The official git repo is more reliable and is the original source.
+  local GIT_SOURCE="source 'https://github.com/CocoaPods/Specs.git'"
+  if grep -q "github.com/CocoaPods/Specs" "$PODFILE"; then
+    ok "Podfile already uses git-based CocoaPods spec repo"
+  else
+    # Remove any existing CDN source lines, then prepend the git source
+    _sed_i "/^[[:space:]]*source '.*cocoapods.org.*'/d" "$PODFILE" 2>/dev/null || true
+    _sed_i "/^[[:space:]]*source '.*cdn\.cocoapods/d"  "$PODFILE" 2>/dev/null || true
+    _sed_i "1s|^|${GIT_SOURCE}\n|" "$PODFILE"
+    ok "Switched Podfile spec source → git (github.com/CocoaPods/Specs)"
+  fi
+
+  # ── 2. Ensure 'platform :ios' is declared ──────────────────
+  local IOS_MIN_VERSION="13.0"
+  if grep -qE "^[[:space:]]*platform :ios" "$PODFILE"; then
+    local current_ver
+    current_ver=$(grep -E "^[[:space:]]*platform :ios" "$PODFILE" \
+      | head -1 | grep -oE "[0-9]+\.[0-9]+" | head -1 || true)
+    if [[ "$current_ver" == "$IOS_MIN_VERSION" ]]; then
+      ok "Podfile already has platform :ios, '$IOS_MIN_VERSION'"
+    else
+      warn "Updating platform :ios from '$current_ver' → '$IOS_MIN_VERSION'"
+      _sed_i "s|^[[:space:]]*platform :ios.*|platform :ios, '$IOS_MIN_VERSION'|" "$PODFILE"
+      ok "Podfile platform :ios updated → $IOS_MIN_VERSION"
+    fi
+  else
+    _sed_i "1s|^|platform :ios, '$IOS_MIN_VERSION'\n|" "$PODFILE"
+    ok "Added platform :ios, '$IOS_MIN_VERSION' to Podfile"
+  fi
+
+  # ── 3. Suppress Swift Package Manager warning ───────────────
+  if ! grep -q "use_frameworks!" "$PODFILE"; then
+    _sed_i "/^platform :ios/a\\
+use_frameworks! :linkage => :static" "$PODFILE" 2>/dev/null \
+      && ok "Added use_frameworks! :linkage => :static to Podfile" \
+      || warn "Could not add use_frameworks! — add it manually after the platform line"
+  else
+    ok "Podfile already contains use_frameworks!"
+  fi
+
+  # ── 4. Ensure post_install raises all pod deployment targets ───
+  # Many pods (abseil, BoringSSL-GRPC, AppAuth, etc.) ship with
+  # IPHONEOS_DEPLOYMENT_TARGET = 9.0 or 10.0.  Since Xcode 15+ the valid
+  # simulator range starts at 12.0, so those values produce build warnings
+  # that become errors in future Xcode releases.
+  # The post_install hook iterates every pod target and raises the value
+  # to IOS_MIN_VERSION (13.0) when it is lower.
+  _patch_podfile_post_install "$PODFILE" "$IOS_MIN_VERSION"
+}
+
+# ── Inject / update post_install deployment-target hook ──────────
+#
+# FIX: The previous sed /a\ multi-line injection silently fails on
+# macOS BSD sed.  When it failed the marker was never written, so the
+# fallback cat>> appended a *second* post_install block — CocoaPods
+# rejects that with "Specifying multiple post_install hooks is unsupported."
+#
+# New approach: use python3 (always present on macOS) to read the
+# Podfile as plain text, locate the first post_install block and inject
+# our loop right after its opening line, or append a fresh block when
+# none exists.  Fully idempotent via MARKER.
+#
+_patch_podfile_post_install() {
+  local PODFILE="$1"
+  local MIN_VER="$2"
+  local MARKER="# moneyflow-build-tool: deployment target fix"
+
+  # If marker already present, validate the block is syntactically correct.
+  # set -e would kill the script if python3 exits non-zero, so we use || true.
+  if grep -q "$MARKER" "$PODFILE" 2>/dev/null; then
+    local block_ok
+    python3 - "$PODFILE" <<'PYEOF' && block_ok=0 || block_ok=1
+import sys, re
+path = sys.argv[1]
+lines = open(path).readlines()
+in_block = depth = 0
+for line in lines:
+    s = line.strip()
+    if not in_block and re.match(r'post_install\s+do\b', s):
+        in_block = 1
+        depth = 1
+        continue
+    if in_block:
+        if not s.startswith('#'):
+            depth += s.count('do')
+            depth -= s.count('end')
+        if depth <= 0:
+            sys.exit(0)
+sys.exit(1)
+PYEOF
+    if [[ "${block_ok:-1}" -eq 0 ]]; then
+      ok "Podfile post_install deployment-target hook already present"
+      return
+    fi
+    warn "Podfile post_install block is malformed — stripping and rewriting ..."
+    python3 - "$PODFILE" <<'PYEOF' || true
+import sys, re
+path = sys.argv[1]
+lines = open(path).readlines()
+out = []
+in_block = depth = 0
+for line in lines:
+    s = line.strip()
+    if not in_block and re.match(r'post_install\s+do\b', s):
+        in_block = 1
+        depth = 1
+        continue
+    if in_block:
+        if not s.startswith('#'):
+            depth += s.count('do')
+            depth -= s.count('end')
+        if depth <= 0:
+            in_block = 0
+            depth = 0
+        continue
+    out.append(line)
+open(path, 'w').write("".join(out).rstrip() + "\n")
+PYEOF
+  fi
+
+  if ! command -v python3 &>/dev/null; then
+    warn "python3 not found — cannot patch post_install block automatically"
+    warn "Add the deployment-target loop manually inside your post_install block."
+    return
+  fi
+
+  info "Injecting deployment-target fix into Podfile post_install block ..."
+
+  python3 - "$PODFILE" "$MIN_VER" "$MARKER" <<'PYEOF' || true
+import sys, re
+podfile_path = sys.argv[1]
+min_ver      = sys.argv[2]
+marker       = sys.argv[3]
+
+inject_lines = (
+    "  " + marker + "\n"
+    "  installer.pods_project.targets.each do |target|\n"
+    "    flutter_additional_ios_build_settings(target)\n"
+    "    target.build_configurations.each do |config|\n"
+    "      min = config.build_settings['IPHONEOS_DEPLOYMENT_TARGET']\n"
+    "      if min.to_f < " + min_ver + ".to_f\n"
+    "        config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '" + min_ver + "'\n"
+    "      end\n"
+    "    end\n"
+    "  end\n"
+)
+
+content = open(podfile_path).read()
+if marker in content:
+    sys.exit(0)
+
+pattern = re.compile(r'(^post_install\s+do\s+\|[^|]*\|[^\n]*\n)', re.MULTILINE)
+m = pattern.search(content)
+if m:
+    insert_at = m.end()
+    new_content = content[:insert_at] + inject_lines + content[insert_at:]
+    open(podfile_path, 'w').write(new_content)
+    sys.exit(0)
+
+new_block = "\npost_install do |installer|\n" + inject_lines + "end\n"
+open(podfile_path, 'a').write(new_block)
+PYEOF
+
+  local rc=$?
+  if [[ $rc -eq 0 ]] && grep -q "$MARKER" "$PODFILE" 2>/dev/null; then
+    ok "Podfile post_install deployment-target hook injected (min iOS $MIN_VER)"
+  else
+    warn "Could not auto-patch Podfile post_install block."
+    warn "Add the deployment-target loop manually inside your post_install block."
+  fi
+}
+
+#
+fix_podfile_duplicate_post_install() {
+  local PODFILE="$PROJECT_DIR/ios/Podfile"
+  if [[ ! -f "$PODFILE" ]]; then return; fi
+
+  local count
+  count=$(grep -c "^post_install" "$PODFILE" 2>/dev/null || true)
+  if [[ "$count" -le 1 ]]; then
+    return  # only one (or zero) block — nothing to fix
+  fi
+
+  warn "Podfile has $count post_install blocks — stripping all and rewriting one clean block ..."
+
+  # Strategy: remove ALL post_install blocks entirely, then let
+  # _patch_podfile_post_install write a single correct block fresh.
+  # This is safer than trying to merge blocks whose end keywords may
+  # have been lost or duplicated by earlier bad patches.
+  python3 - "$PODFILE" <<'PYEOF'
+import sys, re
+
+path = sys.argv[1]
+with open(path, 'r') as fh:
+    lines = fh.readlines()
+
+out = []
+in_block = False
+depth = 0
+
+for line in lines:
+    s = line.strip()
+    if not in_block and re.match(r'post_install\s+do', s):
+        in_block = True
+        depth = 1
+        continue
+    if in_block:
+        # Only count do/end on lines that are not comments
+        if not s.startswith('#'):
+            depth += len(re.findall(r'do', s))
+            depth -= s.count('end')
+        if depth <= 0:
+            in_block = False
+            depth = 0
+        continue
+    out.append(line)
+
+result = "".join(out).rstrip() + "\n"
+with open(path, 'w') as fh:
+    fh.write(result)
+
+remaining = sum(1 for l in result.splitlines() if re.match(r'post_install\s+do', l.strip()))
+print(f"Removed all post_install blocks. Remaining: {remaining}")
+PYEOF
+
+  local rc=$?
+  local remaining
+  remaining=$(grep -c "^post_install" "$PODFILE" 2>/dev/null || echo "?")
+  if [[ $rc -eq 0 && "$remaining" == "0" ]]; then
+    ok "All post_install blocks removed — will write one clean block now"
+    # Clear the marker so _patch_podfile_post_install writes a fresh block
+    local MARKER="# moneyflow-build-tool: deployment target fix"
+    # (marker is already gone since we stripped the blocks — this is a no-op)
+  else
+    warn "Could not fully strip post_install blocks ($remaining remain)."
+    warn "Manually remove all post_install blocks from ios/Podfile and re-run."
   fi
 }
 
 # ── Step 4 — pod install ─────────────────────────────────────
+# Runs pod install with a 3-attempt strategy to handle CDN flakiness:
+#   Attempt 1: pod install --no-repo-update  (fast — uses local cache)
+#   Attempt 2: pod install --repo-update     (refreshes git spec repo)
+#   Attempt 3: Detects CDN errors, forces Podfile to git source, retries
 pod_install() {
   hdr "Step 4: pod install"
   if ! command -v pod &>/dev/null; then
     err "CocoaPods not found. Install with: sudo gem install cocoapods"
   fi
+
   cd "$PROJECT_DIR/ios"
-  pod install --repo-update
+
+  local PODFILE="$PROJECT_DIR/ios/Podfile"
+
+  # ── Attempt 1: fast path — no repo update (uses cached specs) ──
+  info "pod install --no-repo-update  (attempt 1/3 — fast path)"
+  local pod_out pod_rc
+  pod_out=$(pod install --no-repo-update 2>&1) && pod_rc=0 || pod_rc=$?
+
+  if [[ $pod_rc -eq 0 ]]; then
+    cd "$PROJECT_DIR"
+    ok "pod install complete (fast path)"
+    return 0
+  fi
+
+  # ── Attempt 2: full repo update ────────────────────────────────
+  info "Fast path failed — retrying with --repo-update  (attempt 2/3)"
+  pod_out=$(pod install --repo-update 2>&1) && pod_rc=0 || pod_rc=$?
+
+  if [[ $pod_rc -eq 0 ]]; then
+    cd "$PROJECT_DIR"
+    ok "pod install complete (with repo update)"
+    return 0
+  fi
+
+  # ── Attempt 3: CDN error detected — switch to git spec source ──
+  # "Error in the HTTP2 framing layer" and "CDN: trunk URL couldn't be
+  # downloaded" both indicate the jsdelivr.net CDN is unreachable.
+  # Switching the source line to github.com/CocoaPods/Specs bypasses it.
+  if echo "$pod_out" | grep -qE "CDN|HTTP2|jsdelivr|trunk URL"; then
+    warn "CocoaPods CDN unreachable (HTTP/2 error) — switching to git spec repo"
+
+    local GIT_SOURCE="source 'https://github.com/CocoaPods/Specs.git'"
+    if ! grep -q "github.com/CocoaPods/Specs" "$PODFILE"; then
+      _sed_i "/^[[:space:]]*source '.*cocoapods.org.*'/d" "$PODFILE" 2>/dev/null || true
+      _sed_i "/^[[:space:]]*source '.*cdn/d"              "$PODFILE" 2>/dev/null || true
+      _sed_i "1s|^|${GIT_SOURCE}\n|" "$PODFILE"
+      ok "Podfile source switched to git repo"
+    fi
+
+    info "pod install --repo-update  (attempt 3/3 — git source)"
+    pod_out=$(pod install --repo-update 2>&1) && pod_rc=0 || pod_rc=$?
+
+    if [[ $pod_rc -eq 0 ]]; then
+      cd "$PROJECT_DIR"
+      ok "pod install complete (git source fallback)"
+      return 0
+    fi
+  fi
+
+  # ── All attempts failed — print full output and abort ──────────
   cd "$PROJECT_DIR"
-  ok "pod install complete"
+  echo "$pod_out"
+  err "pod install failed after 3 attempts. See output above for details."
 }
 
 # ── Pick an Android target (emulator or real device) ─────────
@@ -900,29 +1472,327 @@ build_android_release() {
 #  iOS
 # ═══════════════════════════════════════════════════════════════
 
+# ── Patch pubspec.yaml Firebase deps for iOS compatibility ────
+#
+# ROOT CAUSE OF CocoaPods CONFLICT:
+#   firebase_core 2.x  →  Firebase iOS SDK 10.x  →  GoogleUtilities ~> 7.12
+#   google_sign_in_ios 5.9+ → GoogleSignIn ~> 8.0 → GoogleUtilities = 8.0.0
+#   These two ranges (>=7.12 <8.0) and (=8.0.0) are INCOMPATIBLE.
+#
+# FIX: Upgrade to firebase_core 3.x which targets Firebase iOS SDK 11.x
+#   firebase_core 3.x  →  Firebase iOS SDK 11.x  →  GoogleUtilities ~> 8.0
+#   Now both chains resolve to GoogleUtilities 8.x  ✔
+#
+# This function rewrites the firebase_* entries in pubspec.yaml in-place
+# ONLY when the installed major version is still 2.x.
+# All changes are logged so the developer can review them.
+patch_pubspec_firebase_deps() {
+  hdr "Step 2b: iOS — patch pubspec.yaml Firebase dependencies"
+
+  local PUBSPEC="$PROJECT_DIR/pubspec.yaml"
+  if [[ ! -f "$PUBSPEC" ]]; then
+    warn "pubspec.yaml not found at $PROJECT_DIR — skipping"
+    return
+  fi
+
+  # Detect current firebase_core major version
+  local current_ver
+  current_ver=$(grep -E "^\s+firebase_core\s*:" "$PUBSPEC" \
+    | head -1 \
+    | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" \
+    | head -1 || true)
+
+  local major="${current_ver%%.*}"
+
+  if [[ -z "$major" ]]; then
+    warn "Could not detect firebase_core version in pubspec.yaml — skipping auto-upgrade"
+    return
+  fi
+
+  if [[ "$major" -ge 3 ]]; then
+    ok "firebase_core is already v${current_ver} (3.x+) — no upgrade needed"
+    return
+  fi
+
+  warn "firebase_core $current_ver uses Firebase iOS SDK 10.x (GoogleUtilities ~> 7.x)"
+  warn "google_sign_in_ios 5.9+ needs GoogleUtilities 8.x — INCOMPATIBLE"
+  info "Auto-upgrading Firebase Flutter packages to 3.x (Firebase SDK 11.x)..."
+
+  # ── Version map: 2.x → compatible 3.x floor ──────────────────
+  # Plain "pkg:version" pairs — no associative arrays (bash 3.2 / macOS safe).
+  # Using ^X.Y.Z lets pub pick the newest non-breaking release automatically.
+  local UPGRADES="
+    firebase_core:^3.6.0
+    firebase_auth:^5.3.1
+    cloud_firestore:^5.4.4
+    firebase_analytics:^11.3.3
+    firebase_crashlytics:^4.1.3
+    firebase_messaging:^15.1.3
+    firebase_storage:^12.3.3
+    firebase_remote_config:^5.1.3
+    firebase_dynamic_links:^6.0.8
+    firebase_in_app_messaging:^0.8.0+3
+    firebase_performance:^0.10.0+8
+    cloud_functions:^5.1.3
+  "
+
+  local patched=0
+  local pair pkg new_ver new_ver_num old_line new_line
+  while IFS= read -r pair; do
+    pair="${pair//[[:space:]]/}"          # strip all whitespace / blank lines
+    [[ -z "$pair" ]] && continue
+    pkg="${pair%%:*}"                     # everything before first :
+    new_ver="${pair#*:}"                  # everything after first :
+    new_ver_num="${new_ver#^}"            # strip leading ^ for sed replacement
+
+    # Match lines like:  firebase_core: ^2.32.0  OR  firebase_core: 2.32.0
+    if grep -qE "^[[:space:]]+${pkg}[[:space:]]*:" "$PUBSPEC"; then
+      old_line=$(grep -E "^[[:space:]]+${pkg}[[:space:]]*:" "$PUBSPEC" | head -1)
+      # Replace the semver number, preserving any leading ^
+      new_line=$(echo "$old_line" | sed -E "s|(\^?)[0-9]+\.[0-9]+\.[0-9]+([+.][0-9]+)*|\1${new_ver_num}|")
+      _sed_i "s|${old_line}|${new_line}|" "$PUBSPEC"
+      ok "  $pkg  ->  ${new_ver}  (was: $(echo "$old_line" | xargs))"
+      patched=$((patched + 1))
+    fi
+  done <<< "$UPGRADES"
+
+  if [[ $patched -eq 0 ]]; then
+    warn "No Firebase packages found in pubspec.yaml to upgrade"
+  else
+    ok "$patched Firebase package(s) upgraded in pubspec.yaml"
+    info "Run 'flutter pub outdated' after the build to review remaining constraints."
+  fi
+}
+
+# ── Clear Xcode DerivedData for the Runner project ───────────────
+# 'flutter clean' removes Flutter build outputs but leaves Xcode's
+# DerivedData intact.  Stale precompiled modules there cause:
+#   "Failed to query serialized dependencies"
+#   "Module file … could not be read"
+# Deleting the Runner-specific DerivedData folder forces a clean rebuild.
+clear_derived_data() {
+  hdr "Step 2c: iOS — clear stale DerivedData"
+
+  local DERIVED_BASE="$HOME/Library/Developer/Xcode/DerivedData"
+  if [[ ! -d "$DERIVED_BASE" ]]; then
+    ok "DerivedData folder not found — nothing to clear"
+    return
+  fi
+
+  # Match Runner-* folders (Flutter iOS projects always use 'Runner' as the scheme)
+  local found=0
+  for dir in "$DERIVED_BASE"/Runner-*/; do
+    [[ -d "$dir" ]] || continue
+    info "Removing stale DerivedData: $(basename "$dir")"
+    rm -rf "$dir"
+    found=$((found + 1))
+  done
+
+  if [[ $found -eq 0 ]]; then
+    ok "No Runner DerivedData to clear"
+  else
+    ok "Cleared $found DerivedData folder(s) — Xcode will do a clean build"
+  fi
+}
+
+# ── iOS device / simulator picker ────────────────────────────
+# Sets the global IOS_DEVICE_ID used by flutter run -d.
+IOS_DEVICE_ID=""
+
+pick_ios_device() {
+  hdr "Step 4b: Select iOS target"
+  echo ""
+
+  local -a all_ids all_labels all_types
+  local idx=0
+
+  # ── Section 1: Real devices from flutter devices ─────────────
+  local real_raw
+  real_raw=$(flutter devices 2>/dev/null | grep -iE "ios|iphone|ipad" | grep -iv "simulator" || true)
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local dev_name dev_id dev_platform
+    dev_name=$(    echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}')
+    dev_id=$(      echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+    dev_platform=$(echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$3); print $3}')
+    [[ -z "$dev_id" ]] && continue
+    idx=$((idx + 1))
+    all_ids[$idx]="$dev_id"
+    all_labels[$idx]="$dev_name  [$dev_id]  ($dev_platform)"
+    all_types[$idx]="device"
+  done <<< "$real_raw"
+
+  local real_count=$idx
+
+  # ── Section 2: Booted simulators from flutter devices ────────
+  local sim_flutter_raw
+  sim_flutter_raw=$(flutter devices 2>/dev/null | grep -i "simulator" || true)
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local dev_name dev_id dev_platform
+    dev_name=$(    echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}')
+    dev_id=$(      echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+    dev_platform=$(echo "$line" | awk -F'•' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$3); print $3}')
+    [[ -z "$dev_id" ]] && continue
+    idx=$((idx + 1))
+    all_ids[$idx]="$dev_id"
+    all_labels[$idx]="$dev_name  [$dev_id]  ($dev_platform)"
+    all_types[$idx]="booted"
+  done <<< "$sim_flutter_raw"
+
+  local booted_count=$((idx - real_count))
+
+  # ── Section 3: Available (not booted) simulators via xcrun ───
+  local sim_raw
+  sim_raw=$(xcrun simctl list devices available 2>/dev/null     | grep -E "iPhone|iPad" | head -30 || true)
+
+  local -a avail_ids avail_names
+  local aidx=0
+  while IFS= read -r sline; do
+    [[ -z "$sline" ]] && continue
+    local sim_name sim_udid
+    sim_name=$(echo "$sline" | sed -E 's/ \(.*$//' | xargs)
+    sim_udid=$(echo "$sline" | grep -oE '[A-F0-9-]{36}' | head -1 || true)
+    [[ -z "$sim_udid" ]] && continue
+    # Skip if already booted (already listed above)
+    if echo "$sim_flutter_raw" | grep -q "$sim_udid"; then continue; fi
+    aidx=$((aidx + 1))
+    avail_ids[$aidx]="$sim_udid"
+    avail_names[$aidx]="$sim_name"
+    idx=$((idx + 1))
+    all_ids[$idx]="$sim_udid"
+    all_labels[$idx]="$sim_name  [$sim_udid]"
+    all_types[$idx]="simulator"
+  done <<< "$sim_raw"
+
+  # ── Display unified list ─────────────────────────────────────
+  if [[ $idx -eq 0 ]]; then
+    err "No iOS devices or simulators found. Connect a device or open Xcode → Simulator."
+  fi
+
+  echo ""
+  local i
+  for i in $(seq 1 $idx); do
+    case "${all_types[$i]}" in
+      device)    echo "   $i)  📱  ${all_labels[$i]}  ← real device" ;;
+      booted)    echo "   $i)  🖥️   ${all_labels[$i]}  ← simulator (running)" ;;
+      simulator) echo "   $i)  💤  ${all_labels[$i]}  ← simulator (not running)" ;;
+    esac
+  done
+  echo ""
+  printf "  Select target [1-$idx]: "
+  local sel; read -r sel
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || [[ $sel -lt 1 ]] || [[ $sel -gt $idx ]]; then
+    warn "Invalid — try again."; pick_ios_device; return
+  fi
+
+  local chosen_id="${all_ids[$sel]}"
+  local chosen_type="${all_types[$sel]}"
+
+  # ── Boot simulator if not already running ────────────────────
+  if [[ "$chosen_type" == "simulator" ]]; then
+    info "Booting simulator $chosen_id ..."
+    xcrun simctl boot "$chosen_id" 2>/dev/null || true
+    open -a Simulator 2>/dev/null || true
+    info "Waiting for simulator to appear in Flutter (up to 30s)..."
+    local waited=0
+    while true; do
+      local booted
+      booted=$(flutter devices 2>/dev/null | grep "$chosen_id" || true)
+      [[ -n "$booted" ]] && break
+      sleep 3; waited=$((waited + 3))
+      printf "."
+      [[ $waited -ge 30 ]] && break
+    done
+    echo ""
+    ok "Simulator booted → $chosen_id"
+  fi
+
+  IOS_DEVICE_ID="$chosen_id"
+  ok "iOS target selected → $IOS_DEVICE_ID  ($chosen_type)"
+}
+
 ios_common() {
   check_deps
-  flutter_clean_get
-  copy_ios_files
+  patch_pubspec_firebase_deps   # upgrades firebase_core 2.x → 3.x (fixes GoogleUtilities conflict)
+  flutter_clean_get             # flutter clean + pub get (picks up upgraded versions)
+  clear_derived_data            # removes stale Xcode DerivedData (fixes "Failed to query serialized dependencies")
+  copy_ios_files                # copies GoogleService-Info.plist + injects REVERSED_CLIENT_ID
+  fix_podfile_duplicate_post_install  # strip any duplicate post_install blocks first
+  patch_ios_podfile             # platform :ios, use_frameworks!, post_install deployment-target hook
   pod_install
+  patch_xcode_backend           # fixes "xcode_backend.sh: No such file or directory"
 }
+# ── Patch Xcode build phase: fix broken xcode_backend.sh path ────
+#
+# ROOT CAUSE:
+#   The "Run Flutter Build Script" build phase in project.pbxproj contains
+#   a hardcoded absolute path to xcode_backend.sh that is machine-specific:
+#     /packages/flutter_tools/bin/xcode_backend.sh build
+#
+# FIX:
+#   Rewrite it to use $FLUTTER_ROOT so it works on every machine:
+#     "$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh" build
+#
+patch_xcode_backend() {
+  hdr "Step 4c: iOS — fix xcode_backend.sh path in project.pbxproj"
+
+  local PBXPROJ="$PROJECT_DIR/ios/Runner.xcodeproj/project.pbxproj"
+  if [[ ! -f "$PBXPROJ" ]]; then
+    warn "project.pbxproj not found — skipping xcode_backend patch"
+    return
+  fi
+
+  if grep -q 'FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh' "$PBXPROJ"; then
+    ok "xcode_backend.sh path already uses \$FLUTTER_ROOT — nothing to fix"
+    return
+  fi
+
+  if ! grep -q "xcode_backend.sh" "$PBXPROJ"; then
+    ok "No xcode_backend.sh reference in project.pbxproj — nothing to fix"
+    return
+  fi
+
+  info "Patching xcode_backend.sh path in project.pbxproj ..."
+
+  # Replace any path ending in xcode_backend.sh with the $FLUTTER_ROOT form.
+  # Handles: /some/absolute/path/xcode_backend.sh
+  #          'quoted/path/xcode_backend.sh'
+  #          packages/flutter_tools/bin/xcode_backend.sh  (relative)
+  _sed_i "s|['\"/]*[^ '\"]*xcode_backend\.sh['\"/]*|\"\$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh\"|g" \
+    "$PBXPROJ" 2>/dev/null || true
+
+  if grep -q 'FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh' "$PBXPROJ"; then
+    ok "xcode_backend.sh path patched → \"\$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh\""
+  else
+    warn "Could not auto-patch xcode_backend.sh path."
+    warn "Open Xcode → Runner target → Build Phases → Run Flutter Build Script"
+    warn "and change the script to:"
+    warn "  \"\$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh\" build"
+  fi
+}
+
 
 run_ios_debug() {
   echo -e "\n${BOLD}▶  iOS — Run Debug${RESET}"
   echo "  ──────────────────────────────────────────────"
   ios_common
+  pick_ios_device
   hdr "Step 5: Run on iOS (debug)"
-  info "flutter run --debug"
-  flutter run --debug
+  info "flutter run -d \"$IOS_DEVICE_ID\" --debug"
+  flutter run -d "$IOS_DEVICE_ID" --debug
 }
 
 run_ios_release() {
   echo -e "\n${BOLD}▶  iOS — Run Release${RESET}"
   echo "  ──────────────────────────────────────────────"
   ios_common
+  pick_ios_device
   hdr "Step 5: Run on iOS (release)"
-  info "flutter run --release"
-  flutter run --release
+  info "flutter run -d \"$IOS_DEVICE_ID\" --release"
+  flutter run -d "$IOS_DEVICE_ID" --release
 }
 
 build_ios_ipa() {
