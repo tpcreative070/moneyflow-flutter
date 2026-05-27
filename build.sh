@@ -417,6 +417,43 @@ PYEOF
     fi
   fi
 
+  # ── Cross-check: iOS bundle_id embedded in google-services.json ──
+  # google-services.json can optionally embed an iOS client entry under
+  # appinvite_service.other_platform_oauth_client.  If that ios_info.bundle_id
+  # does NOT match $IOS_BUNDLE_ID the Firebase App Invites / Dynamic Links
+  # SDK on iOS will silently use the wrong client, and Google Sign-In may
+  # fail at runtime.  This is a Firebase Console misconfiguration — fix it
+  # there, not in the file.
+  if command -v python3 &>/dev/null && [[ -f "$GS_DST" ]]; then
+    local found_ios_bundle
+    found_ios_bundle=$(python3 - "$GS_DST" <<'PYEOF2'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    for client in data.get("client", []):
+        for oc in client.get("services", {}).get("appinvite_service", {}).get("other_platform_oauth_client", []):
+            ios = oc.get("ios_info", {})
+            bid = ios.get("bundle_id", "")
+            if bid:
+                print(bid)
+                break
+except Exception:
+    pass
+PYEOF2
+    )
+    if [[ -n "$found_ios_bundle" ]]; then
+      if [[ "$found_ios_bundle" == "$IOS_BUNDLE_ID" ]]; then
+        ok "google-services.json ios_info.bundle_id ✔ → $found_ios_bundle"
+      else
+        warn "google-services.json ios_info.bundle_id MISMATCH — Firebase Console misconfiguration!"
+        warn "  Expected : $IOS_BUNDLE_ID"
+        warn "  Found    : $found_ios_bundle"
+        warn "  Fix: Firebase Console → Project Settings → Your iOS app → verify Bundle ID is $IOS_BUNDLE_ID"
+        warn "  Then re-download google-services.json and replace the copy next to build.sh."
+      fi
+    fi
+  fi
+
   # ── key.properties ───────────────────────────────────────────
   local KP="$PROJECT_DIR/android/key.properties"
   if [[ -f "$KP" ]]; then
@@ -569,10 +606,14 @@ _patch_ios_bundle_id() {
     warn "REVERSED_CLIENT_ID not found in GoogleService-Info.plist — Google Sign-In may fail"
   elif [[ ! -f "$INFO_PLIST" ]]; then
     warn "ios/Runner/Info.plist not found — skipping URL scheme injection"
-  elif grep -q "$reversed_id" "$INFO_PLIST"; then
-    ok "REVERSED_CLIENT_ID URL scheme already present in Info.plist → $reversed_id"
   else
-    info "Injecting REVERSED_CLIENT_ID URL scheme into ios/Runner/Info.plist"
+    # FIX: always call _inject_url_scheme — it strips stale
+    # com.googleusercontent.apps.* entries before writing, so re-runs
+    # with a changed client ID (or leftovers from a previous run) can
+    # never leave the wrong scheme silently in place.
+    # The old guard skipped injection whenever ANY reversed client ID was
+    # present, even if it was a stale value from a different OAuth client.
+    info "Ensuring REVERSED_CLIENT_ID URL scheme in ios/Runner/Info.plist → $reversed_id"
     _inject_url_scheme "$reversed_id" "$INFO_PLIST"
   fi
 }
@@ -692,9 +733,62 @@ PYEOF2
 # Strategy 1: PlistBuddy  (macOS native — most reliable, handles binary + XML)
 # Strategy 2: python3 plistlib  (cross-platform, handles any plist format)
 # Strategy 3: sed fallback  (last resort, XML-only)
+#
+# FIX: stale REVERSED_CLIENT_ID idempotency bug.
+#   The old guard `grep -q "$reversed_id" "$INFO_PLIST"` skipped injection
+#   when ANY com.googleusercontent.apps.* scheme was already present — even
+#   the wrong one from a previous run with a different client ID.
+#   The fix is to ALWAYS strip every com.googleusercontent.apps.* entry
+#   before writing, so the correct value is always the only one present.
+_strip_stale_reversed_client_id() {
+  local INFO_PLIST="$1"
+
+  # ── Strip via python3 plistlib (handles binary + XML) ──────
+  if command -v python3 &>/dev/null; then
+    python3 - "$INFO_PLIST" <<'PYEOF' 2>/dev/null || true
+import sys, plistlib, pathlib
+
+plist_path = pathlib.Path(sys.argv[1])
+with open(plist_path, 'rb') as fh:
+    data = plistlib.load(fh)
+
+url_types = data.get('CFBundleURLTypes', [])
+cleaned = []
+removed = 0
+for entry in url_types:
+    schemes = entry.get('CFBundleURLSchemes', [])
+    # Drop any entry whose scheme is a reversed Google OAuth client ID
+    if any(s.startswith('com.googleusercontent.apps.') for s in schemes):
+        removed += 1
+    else:
+        cleaned.append(entry)
+
+if removed:
+    data['CFBundleURLTypes'] = cleaned
+    with open(plist_path, 'wb') as fh:
+        plistlib.dump(data, fh, fmt=plistlib.FMT_XML)
+    print(f"  stripped {removed} stale REVERSED_CLIENT_ID scheme(s) from Info.plist")
+PYEOF
+    return
+  fi
+
+  # ── Fallback: sed strip (XML only) ─────────────────────────
+  # Remove <dict>…</dict> blocks containing com.googleusercontent.apps.*
+  # This is best-effort; python3 path above is strongly preferred.
+  _sed_i '/com\.googleusercontent\.apps\./,/<\/dict>/{
+    /<\/dict>/d
+    d
+  }' "$INFO_PLIST" 2>/dev/null || true
+}
+
 _inject_url_scheme() {
   local reversed_id="$1"
   local INFO_PLIST="$2"
+
+  # ── Always strip stale Google OAuth URL schemes first ──────
+  # This makes injection idempotent regardless of what a previous
+  # run (or a manual edit) may have written.
+  _strip_stale_reversed_client_id "$INFO_PLIST"
 
   # ── Strategy 1: PlistBuddy ─────────────────────────────────
   if command -v /usr/libexec/PlistBuddy &>/dev/null; then
@@ -741,7 +835,8 @@ with open(plist_path, 'rb') as fh:
 
 url_types = data.setdefault('CFBundleURLTypes', [])
 
-# Check not already present (idempotent)
+# Stale entries were already stripped by _strip_stale_reversed_client_id;
+# this guard is a final safety net in case we are called standalone.
 for entry in url_types:
     schemes = entry.get('CFBundleURLSchemes', [])
     if reversed_id in schemes:
@@ -1720,11 +1815,139 @@ ios_common() {
   flutter_clean_get             # flutter clean + pub get (picks up upgraded versions)
   clear_derived_data            # removes stale Xcode DerivedData (fixes "Failed to query serialized dependencies")
   copy_ios_files                # copies GoogleService-Info.plist + injects REVERSED_CLIENT_ID
+  patch_appdelegate_google_sign_in  # fix SIGABRT: inject GIDConfiguration (GoogleSignIn SDK 7+)
   fix_podfile_duplicate_post_install  # strip any duplicate post_install blocks first
   patch_ios_podfile             # platform :ios, use_frameworks!, post_install deployment-target hook
   pod_install
   patch_xcode_backend           # fixes "xcode_backend.sh: No such file or directory"
 }
+# ── Patch AppDelegate.swift: inject GIDConfiguration (GoogleSignIn SDK 7+) ──
+#
+# ROOT CAUSE of SIGABRT at GIDSignIn.m:592:
+#   GoogleSignIn SDK 7+ (shipped in google_sign_in_ios 5.9+) removed auto-reading
+#   of clientID from GoogleService-Info.plist.  You must now set it explicitly via
+#   GIDSignIn.sharedInstance.configuration before any sign-in call.
+#   When it is missing, signInWithOptions: throws an NSException → uncaught →
+#   SIGABRT crash as seen in the crash report (GIDSignIn.m:592).
+#
+# FIX:
+#   Inject into AppDelegate.swift (before GeneratedPluginRegistrant.register):
+#     GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: "…")
+#   clientID is read from the GoogleService-Info.plist that was already copied
+#   to ios/Runner/ by copy_ios_files, so this step must run AFTER copy_ios_files.
+#   The patch is idempotent — re-runs detect the marker and skip.
+#
+patch_appdelegate_google_sign_in() {
+  hdr "Step 4d: iOS — patch AppDelegate for GoogleSignIn SDK 7+ clientID"
+
+  local PLIST_DST="$PROJECT_DIR/ios/Runner/GoogleService-Info.plist"
+  local APPDELEGATE="$PROJECT_DIR/ios/Runner/AppDelegate.swift"
+  local MARKER="GIDSignIn.sharedInstance.configuration"
+
+  # ── Require AppDelegate.swift ─────────────────────────────────
+  if [[ ! -f "$APPDELEGATE" ]]; then
+    warn "ios/Runner/AppDelegate.swift not found — skipping GIDConfiguration patch"
+    warn "  Add manually before GeneratedPluginRegistrant.register(with: self):"
+    warn "    import GoogleSignIn"
+    warn "    GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: \"CLIENT_ID\")"
+    return
+  fi
+
+  # ── Read CLIENT_ID from GoogleService-Info.plist ──────────────
+  local client_id=""
+  if [[ -f "$PLIST_DST" ]]; then
+    client_id=$(grep -A1 "<key>CLIENT_ID</key>" "$PLIST_DST" \
+      | grep "<string>" \
+      | sed 's|.*<string>||;s|</string>.*||' \
+      | xargs 2>/dev/null || true)
+  fi
+
+  if [[ -z "$client_id" ]]; then
+    warn "Could not read CLIENT_ID from GoogleService-Info.plist — copy_ios_files must run first"
+    return
+  fi
+
+  # ── Rewrite AppDelegate.swift unconditionally via python3 ─────
+  # Strategy: parse the existing file to extract any non-import, non-GIDConfig
+  # body content, then emit a canonical file with:
+  #   1. Correct import block (deduped, GoogleSignIn included)
+  #   2. GIDConfiguration call
+  #   3. Original class body (minus any stray imports or duplicate GIDConfig lines)
+  # This handles ANY prior corruption: duplicate imports, stray \n literals,
+  # mismatched braces from sed fallbacks, etc.
+  python3 - "$APPDELEGATE" "$client_id" <<'REWRITE_PY'
+import sys, pathlib, re
+
+path      = pathlib.Path(sys.argv[1])
+client_id = sys.argv[2]
+src       = path.read_text()
+
+MARKER   = "GIDSignIn.sharedInstance.configuration"
+REGISTER = "GeneratedPluginRegistrant.register"
+config   = f'    GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: "{client_id}")'
+
+# ── Collect all import module names (deduplicated, original order) ──
+import_names = list(dict.fromkeys(
+    re.findall(r'^import\s+(\S+)', src, re.MULTILINE)
+))
+if "GoogleSignIn" not in import_names:
+    # Insert after Flutter if present, otherwise append
+    try:
+        idx = import_names.index("Flutter")
+        import_names.insert(idx + 1, "GoogleSignIn")
+    except ValueError:
+        import_names.append("GoogleSignIn")
+
+import_block = "\n".join(f"import {m}" for m in import_names)
+
+# ── Strip ALL import lines from body ─────────────────────────────
+body = re.sub(r'^\s*import\s+\S+[ \t]*\n?', '', src, flags=re.MULTILINE)
+
+# ── Strip any existing GIDConfiguration lines ────────────────────
+body = re.sub(r'.*GIDSignIn\.sharedInstance\.configuration.*\n?', '', body)
+
+# ── Strip any literal \n or stray artifacts left by previous sed ─
+body = body.replace('\\n', '\n')
+
+# ── Trim leading blank lines ──────────────────────────────────────
+body = body.lstrip('\n')
+
+# ── Inject config line before GeneratedPluginRegistrant.register ─
+if REGISTER in body:
+    lines = body.splitlines(keepends=True)
+    out = []
+    for line in lines:
+        if REGISTER in line:
+            out.append(config + "\n")
+        out.append(line)
+    body = "".join(out)
+else:
+    # Fallback: inject before 'return super.application('
+    body = re.sub(
+        r'(\s*return super\.application\()',
+        config + "\n" + r'\1',
+        body,
+        count=1
+    )
+
+final = import_block + "\n\n" + body
+path.write_text(final)
+print("  AppDelegate.swift rewritten to canonical form")
+print(f"  clientID → {client_id}")
+REWRITE_PY
+
+  # ── Verify ───────────────────────────────────────────────────
+  if grep -q "$MARKER" "$APPDELEGATE" 2>/dev/null; then
+    ok "AppDelegate.swift patched — GIDConfiguration set before plugin registration"
+    ok "  clientID → $client_id"
+  else
+    warn "Auto-patch failed. Add manually to AppDelegate.swift:"
+    warn "  import GoogleSignIn   ← at top of file"
+    warn "  GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: \"${client_id}\")"
+    warn "  ← insert before GeneratedPluginRegistrant.register(with: self)"
+  fi
+}
+
 # ── Patch Xcode build phase: fix broken xcode_backend.sh path ────
 #
 # ROOT CAUSE:
