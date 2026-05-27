@@ -43,6 +43,19 @@ class AuthProvider extends ChangeNotifier {
   bool get isLoading     => _isLoading;
 
   AuthProvider() {
+    // FIX: safety net — if Firebase.initializeApp() timed out or failed,
+    // authStateChanges() will never emit an event, leaving _isLoading = true
+    // forever and the app stuck on the branded splash screen.
+    // After 6 seconds with no auth event, force _isLoading = false so the
+    // user reaches the AuthScreen and can proceed as a guest.
+    Future.delayed(const Duration(seconds: 6), () {
+      if (_isLoading) {
+        debugPrint('[AuthProvider] auth state timeout — forcing isLoading=false');
+        _isLoading = false;
+        notifyListeners();
+      }
+    });
+
     fb.FirebaseAuth.instance.authStateChanges().listen((firebaseUser) {
       if (!_isGuest) {
         _user = firebaseUser == null
@@ -386,26 +399,43 @@ class TransactionProvider extends ChangeNotifier {
     _syncing = true;
     notifyListeners();
 
+    debugPrint('┌─────────────────────────────────────────');
+    debugPrint('│ [Firestore] SYNC PENDING START');
+    debugPrint('│   pendingUpload=${_pendingUpload.length}  pendingDelete=${_pendingDelete.length}');
+
+    final stopwatch = Stopwatch()..start();
+
     try {
       // Upload anything explicitly queued OR still marked unsynced
       final toUpload = _transactions
           .where((t) => !t.synced || _pendingUpload.contains(t.id))
           .toList();
       if (toUpload.isNotEmpty) {
-        debugPrint('[TransactionProvider] uploading ${toUpload.length} unsynced');
+        debugPrint('│ [Firestore] Uploading ${toUpload.length} unsynced transaction(s)…');
         for (final tx in toUpload) {
           await _uploadOne(tx, uid);
         }
         _pendingUpload.clear();
+      } else {
+        debugPrint('│ [Firestore] Nothing to upload');
       }
 
       // Remote deletes
       final toDelete = List<String>.from(_pendingDelete);
-      for (final id in toDelete) {
-        await _deleteOne(id, uid);
+      if (toDelete.isNotEmpty) {
+        debugPrint('│ [Firestore] Deleting ${toDelete.length} transaction(s) from Firestore…');
+        for (final id in toDelete) {
+          await _deleteOne(id, uid);
+        }
+      } else {
+        debugPrint('│ [Firestore] Nothing to delete');
       }
 
       await _savePendingPrefs();
+
+      stopwatch.stop();
+      debugPrint('│ [Firestore] SYNC PENDING DONE  (${stopwatch.elapsedMilliseconds}ms)  ✅');
+      debugPrint('└─────────────────────────────────────────');
     } finally {
       _syncing = false;
       notifyListeners();
@@ -418,12 +448,23 @@ class TransactionProvider extends ChangeNotifier {
     _isLoading = true;
     notifyListeners();
 
+    debugPrint('┌─────────────────────────────────────────');
+    debugPrint('│ [Firestore] FETCH START  uid=$uid');
+    debugPrint('│ [Firestore] Local cache: ${_transactions.length} transactions');
+
+    final stopwatch = Stopwatch()..start();
+
     try {
       final snap = await _txCol(uid)
           .orderBy('updatedAt', descending: true)
           .get();
 
-      bool didChange = false;
+      debugPrint('│ [Firestore] Remote docs : ${snap.docs.length}');
+
+      int newCount     = 0;
+      int updatedCount = 0;
+      int skippedCount = 0;
+      bool didChange   = false;
 
       for (final doc in snap.docs) {
         final data = doc.data();
@@ -446,10 +487,6 @@ class TransactionProvider extends ChangeNotifier {
           updatedAt:        data['updatedAt'] as String,
         );
 
-        // FIX: the original code skipped ANY transaction already in memory
-        // with `continue`, which means edits made on another device were
-        // silently ignored. Now we compare updatedAt so remote wins when
-        // it is newer (e.g. edited on another device / login).
         final existingIndex =
         _transactions.indexWhere((t) => t.id == doc.id);
 
@@ -458,7 +495,8 @@ class TransactionProvider extends ChangeNotifier {
           await AppDatabase.upsertTransaction(tx);
           _transactions.add(tx);
           didChange = true;
-          debugPrint('[TransactionProvider] ⬇ new from Firestore: ${doc.id}');
+          newCount++;
+          debugPrint('│   ⬇ NEW      ${doc.id}  ${tx.categoryName}  ${tx.type}  ${tx.amount}  date=${tx.date}');
         } else {
           final local = _transactions[existingIndex];
           final remoteIsNewer = tx.updatedAt.compareTo(local.updatedAt) > 0;
@@ -467,7 +505,11 @@ class TransactionProvider extends ChangeNotifier {
             await AppDatabase.upsertTransaction(tx);
             _transactions[existingIndex] = tx;
             didChange = true;
-            debugPrint('[TransactionProvider] ⬇ updated from Firestore: ${doc.id}');
+            updatedCount++;
+            debugPrint('│   ⬇ UPDATED  ${doc.id}  ${tx.categoryName}  localUpdatedAt=${local.updatedAt}  remoteUpdatedAt=${tx.updatedAt}');
+          } else {
+            skippedCount++;
+            debugPrint('│   ✓ SKIP     ${doc.id}  already up-to-date');
           }
         }
       }
@@ -485,8 +527,19 @@ class TransactionProvider extends ChangeNotifier {
       _pendingUpload = {};
       _pendingDelete = {};
       await _savePendingPrefs();
-    } catch (e) {
-      debugPrint('[TransactionProvider] fetchFromFirestore error: $e');
+
+      stopwatch.stop();
+      debugPrint('│');
+      debugPrint('│ [Firestore] FETCH DONE  (${stopwatch.elapsedMilliseconds}ms)');
+      debugPrint('│   new=$newCount  updated=$updatedCount  skipped=$skippedCount');
+      debugPrint('│   total local after merge: ${_transactions.length}');
+      debugPrint('└─────────────────────────────────────────');
+    } catch (e, stack) {
+      stopwatch.stop();
+      debugPrint('│ [Firestore] FETCH ERROR  (${stopwatch.elapsedMilliseconds}ms)');
+      debugPrint('│   $e');
+      debugPrint('│   $stack');
+      debugPrint('└─────────────────────────────────────────');
     } finally {
       _isLoading = false;
       notifyListeners();
@@ -495,6 +548,13 @@ class TransactionProvider extends ChangeNotifier {
 
   // ── private helpers ──────────────────────────────────────────
   Future<void> _uploadOne(TransactionModel tx, String uid) async {
+    debugPrint('┌─────────────────────────────────────────');
+    debugPrint('│ [Firestore] SAVE  id=${tx.id}');
+    debugPrint('│   type=${tx.type}  amount=${tx.amount}  category=${tx.categoryName}');
+    debugPrint('│   date=${tx.date}  note="${tx.note}"');
+    debugPrint('│   hasAttachment=${tx.attachmentBase64 != null}  updatedAt=${tx.updatedAt}');
+
+    final stopwatch = Stopwatch()..start();
     try {
       final data = {
         'id':               tx.id,
@@ -525,21 +585,37 @@ class TransactionProvider extends ChangeNotifier {
       // UI (the cloud icon on each transaction row) never updated after a
       // successful upload because the widget tree was never rebuilt.
       notifyListeners();
-      debugPrint('[TransactionProvider] ✅ synced: ${tx.id}');
-    } catch (e) {
-      debugPrint('[TransactionProvider] _uploadOne error (${tx.id}): $e');
+
+      stopwatch.stop();
+      debugPrint('│ [Firestore] SAVE OK  (${stopwatch.elapsedMilliseconds}ms)  ✅');
+      debugPrint('└─────────────────────────────────────────');
+    } catch (e, stack) {
+      stopwatch.stop();
       _pendingUpload.add(tx.id); // re-queue for retry
+      debugPrint('│ [Firestore] SAVE ERROR  (${stopwatch.elapsedMilliseconds}ms)  ❌');
+      debugPrint('│   $e');
+      debugPrint('│   $stack');
+      debugPrint('└─────────────────────────────────────────');
     }
   }
 
   Future<void> _deleteOne(String id, String uid) async {
+    debugPrint('┌─────────────────────────────────────────');
+    debugPrint('│ [Firestore] DELETE  id=$id');
+    final stopwatch = Stopwatch()..start();
     try {
       await _txCol(uid).doc(id).delete();
       _pendingDelete.remove(id);
-      debugPrint('[TransactionProvider] 🗑 deleted from Firestore: $id');
-    } catch (e) {
-      debugPrint('[TransactionProvider] _deleteOne error ($id): $e');
+      stopwatch.stop();
+      debugPrint('│ [Firestore] DELETE OK  (${stopwatch.elapsedMilliseconds}ms)  🗑');
+      debugPrint('└─────────────────────────────────────────');
+    } catch (e, stack) {
+      stopwatch.stop();
       // keep in _pendingDelete — will retry on next syncPending
+      debugPrint('│ [Firestore] DELETE ERROR  (${stopwatch.elapsedMilliseconds}ms)  ❌');
+      debugPrint('│   $e');
+      debugPrint('│   $stack');
+      debugPrint('└─────────────────────────────────────────');
     }
   }
 
